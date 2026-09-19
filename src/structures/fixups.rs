@@ -4,7 +4,7 @@
 //! every data pointer not as a plain VA but as a link in a *fixup chain*: the
 //! 64-bit slot packs the real target into low bits plus chain-walk metadata
 //! (`next`, `bind`) in the high bits, to be applied by `dyld` at load time.
-//! Until they are applied, reading such a slot as a pointer yields garbage —
+//! Until they are applied, reading such a slot as a pointer yields garbage -
 //! so type / itab / moduledata pointer resolution fails on these objects.
 //!
 //! This module walks the fixup chains and produces a **rebased copy** of the
@@ -18,9 +18,9 @@
 
 use crate::structures::util::{read_u16, read_u32, read_uintptr};
 
-/// `DYLD_CHAINED_PTR_64` — 8-byte slots, `target` is an unslid vmaddr.
+/// `DYLD_CHAINED_PTR_64` - 8-byte slots, `target` is an unslid vmaddr.
 const PTR_64: u16 = 2;
-/// `DYLD_CHAINED_PTR_64_OFFSET` — 8-byte slots, `target` is an offset from the
+/// `DYLD_CHAINED_PTR_64_OFFSET` - 8-byte slots, `target` is an offset from the
 /// image base. This is what the Go/clang toolchain emits.
 const PTR_64_OFFSET: u16 = 6;
 /// Sentinel page-start value meaning "no fixups on this page".
@@ -37,7 +37,7 @@ fn read_u64(data: &[u8], off: usize) -> Option<u64> {
 /// that order). `image_base` is the lowest segment vmaddr.
 ///
 /// Returns `None` if there are no applicable (64-bit) fixups or the blob is
-/// malformed — the caller then uses the original bytes unchanged. Never
+/// malformed - the caller then uses the original bytes unchanged. Never
 /// panics; bounded against malformed offsets and chain cycles.
 pub fn rebase(
     data: &[u8],

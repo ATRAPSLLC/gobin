@@ -11,7 +11,7 @@
 //!
 //! 2. **Descriptor-walking path** (Go 1.27+, which has no typelink table): Walk
 //!    from `moduledata.types + PtrSize` to `moduledata.types + typedesclen`,
-//!    advancing by each type's `DescriptorSize` with pointer alignment — the
+//!    advancing by each type's `DescriptorSize` with pointer alignment - the
 //!    same algorithm as the Go runtime's `moduleTypelinks()`. Nothing past
 //!    `typedesclen` is walkable: the linker groups every `type:`-prefixed
 //!    read-only symbol under one carrier and sorts the non-typelink remainder
@@ -28,7 +28,7 @@
 //! - Type descriptors: `src/internal/abi/type.go`
 //! - Type walking: `src/runtime/type.go` (`moduleTypelinks`)
 //! - Type-section layout: `src/cmd/link/internal/ld/data.go` (`dodataSect`,
-//!   `sym.STYPE` case) — which also records `typedesclen` and `itaboffset`
+//!   `sym.STYPE` case) - which also records `typedesclen` and `itaboffset`
 //! - Moduledata: `src/runtime/symtab.go`
 
 use std::collections::{HashSet, VecDeque};
@@ -105,7 +105,7 @@ pub struct GoType<'a> {
     /// regular-memory, gc-mask-on-demand, direct-iface). `is_named` /
     /// `is_exported` are derived from it; this exposes the unparsed value.
     pub tflag: u8,
-    /// `PtrToThis` — `TypeOff` (offset from `moduledata.types`) of the
+    /// `PtrToThis` - `TypeOff` (offset from `moduledata.types`) of the
     /// pointer-to-this (`*T`) type descriptor, or `0` if the linker emitted
     /// none.
     pub ptr_to_this: i32,
@@ -130,7 +130,7 @@ pub struct GoType<'a> {
     pub exported_method_count: u16,
     /// Kind-specific type details parsed from the type descriptor's extra fields.
     pub detail: TypeDetail<'a>,
-    /// Resolved method list for this type (concrete-type methods only —
+    /// Resolved method list for this type (concrete-type methods only -
     /// interface methods live on [`TypeDetail::Interface`]). Empty if
     /// [`Self::has_uncommon`] is `false`.
     pub methods: Vec<MethodEntry<'a>>,
@@ -141,7 +141,7 @@ pub struct GoType<'a> {
 /// `"[]uint8"`, `"map[string]int"`).
 ///
 /// `name` is `None` when the descriptor could not be located or carries no
-/// name — callers keep the raw `va` and avoid fabricating a label.
+/// name - callers keep the raw `va` and avoid fabricating a label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeRef<'a> {
     /// Virtual address of the referenced type descriptor.
@@ -158,7 +158,7 @@ pub struct MethodEntry<'a> {
     /// Type-descriptor offset relative to `moduledata.types` (`mtyp` field).
     pub type_descriptor_offset: i32,
     /// Resolved name of the method's signature-type descriptor, if it carries
-    /// one. Usually `None`: Go func types are unnamed, so the *name* is empty —
+    /// one. Usually `None`: Go func types are unnamed, so the *name* is empty -
     /// resolve [`Self::type_descriptor_offset`] to a [`TypeDetail::Func`]
     /// (whose params now carry names) for the full signature.
     pub type_name: Option<&'a str>,
@@ -217,11 +217,11 @@ pub struct InterfaceMethod<'a> {
 /// Consumers persist this enum's *kind tag* into long-lived schemas
 /// (database columns, structured logs). The contract:
 ///
-/// - **Variants** — append-only. New kinds appear as new variants; existing
+/// - **Variants** - append-only. New kinds appear as new variants; existing
 ///   variants are never renamed or removed.
-/// - **[`Self::kind_str`]** — fixed forever once shipped; treat the
+/// - **[`Self::kind_str`]** - fixed forever once shipped; treat the
 ///   returned strings as serialization keys.
-/// - **`Debug` strings** — *not* a stability surface.
+/// - **`Debug` strings** - *not* a stability surface.
 #[derive(Debug, Clone)]
 pub enum TypeDetail<'a> {
     /// No extra detail (scalar types, string, unsafe.Pointer).
@@ -572,7 +572,7 @@ impl std::fmt::Display for TypeKind {
 /// Streaming iterator over [`GoType`]s extracted from a binary.
 ///
 /// Backed by [`extract_types_iter`]. Each [`Iterator::next`] call parses one
-/// `abi.Type` lazily — no `Vec` is allocated up front. Skips any descriptor
+/// `abi.Type` lazily - no `Vec` is allocated up front. Skips any descriptor
 /// that fails to parse (adversarial input cannot panic the iteration).
 pub struct TypeIter<'a> {
     ctx: &'a BinaryContext<'a>,
@@ -586,7 +586,7 @@ enum TypeIterStrategy<'a> {
     /// Iterate `int32` offsets from a typelink array.
     Typelinks { tl_data: &'a [u8], pos: usize },
     /// Walk a contiguous descriptor region `[td, end_va)`, advancing by
-    /// `DescriptorSize` with pointer alignment — the same stepper
+    /// `DescriptorSize` with pointer alignment - the same stepper
     /// `runtime.moduleTypelinks` uses on Go 1.27+.
     Walk {
         /// VA of the next descriptor to parse.
@@ -603,7 +603,7 @@ enum TypeIterStrategy<'a> {
 }
 
 impl<'a> TypeIter<'a> {
-    /// An iterator that yields nothing — the result when a binary has no
+    /// An iterator that yields nothing - the result when a binary has no
     /// moduledata, no VA mapping, or no types region.
     pub fn empty(ctx: &'a BinaryContext<'a>) -> Self {
         Self {
@@ -648,7 +648,7 @@ impl<'a> Iterator for TypeIter<'a> {
                     {
                         return Some(go_type);
                     }
-                    // Failed to parse this entry — fall through to the next.
+                    // Failed to parse this entry - fall through to the next.
                 }
                 None
             }
@@ -723,7 +723,7 @@ impl<'a> Iterator for TypeIter<'a> {
 }
 
 /// Construct a streaming iterator over the binary's **reflection-visible**
-/// type descriptors — the set the `typelink` table used to name.
+/// type descriptors - the set the `typelink` table used to name.
 ///
 /// The constructor performs moduledata discovery up front (cheap on ELF /
 /// Mach-O, scan-based on PE) so each [`Iterator::next`] call does only the
@@ -810,8 +810,8 @@ const WALK_SKIP_BUDGET: u32 = 64;
 /// On V5 the region is bounded by `moduledata.typedesclen`, exactly as
 /// `runtime.moduleTypelinks` reads it; the descriptors past that bound are
 /// non-typelink types and then itabs, neither of which belongs in the
-/// typelink enumeration. Pre-V5 binaries have no such bound — they only reach
-/// this walk when both typelink tables are unavailable — so the whole types
+/// typelink enumeration. Pre-V5 binaries have no such bound - they only reach
+/// this walk when both typelink tables are unavailable - so the whole types
 /// region is used.
 ///
 /// The `ptrSize` skip at the head is the slot the linker reserves so that no
@@ -822,7 +822,7 @@ const WALK_SKIP_BUDGET: u32 = 64;
 /// the non-typelink remainder by size, so `[typedesclen, itaboffset)` is a mix
 /// of non-typelink descriptors and `type:.namedata.*` blobs with no recorded
 /// boundary between them. Those descriptors are reachable only by following
-/// references — see [`extract_all_types`].
+/// references - see [`extract_all_types`].
 fn typelink_walk_range(md: &Moduledata, ptr_size: u8) -> Option<(u64, u64)> {
     let start = md.types.checked_add(u64::from(ptr_size))?;
     let end = match md.typedesclen {
@@ -877,7 +877,7 @@ pub fn type_at_va<'a>(
 /// Transitively enumerate every type reachable from `seeds`.
 ///
 /// BFS over type-descriptor virtual addresses: each popped VA is parsed
-/// independently (robust — no reliance on descriptor sizing), and all the
+/// independently (robust - no reliance on descriptor sizing), and all the
 /// types it references are enqueued. Reaches types absent from the seed set
 /// (typically `typelink`), e.g. a struct used only as a pointer's element.
 pub fn extract_all_types<'a>(
@@ -987,7 +987,7 @@ fn resolve_name_at_va<'a>(
 /// Resolve a referenced type descriptor at `type_va` to its display name.
 ///
 /// Parses the `abi.Type` at the target VA and decodes its `Str` (a NameOff
-/// relative to `types_base_va`). One level deep only — Go already stores
+/// relative to `types_base_va`). One level deep only - Go already stores
 /// constructed names like `[]uint8` / `map[string]int` in `Str` for composite
 /// types, so this yields a usable label without reimplementing the runtime's
 /// recursive type formatter. Returns `None` (rather than guessing) when the
@@ -1232,12 +1232,12 @@ fn build_go_type<'a>(
 /// Layout (after the embedded `abi.Type`):
 /// - 4 bytes: `FuncTypeExtra` (`InCount` u16, `OutCount` u16)
 /// - Padding to pointer-size alignment
-/// - `UncommonType` (16 bytes) when the type carries one — the parameter array
+/// - `UncommonType` (16 bytes) when the type carries one - the parameter array
 ///   follows it (see `abi.FuncType.InSlice`)
 /// - `(in_count + out_count) * ps` bytes: `*Type` pointers
 ///
 /// Returns `(inputs, outputs)`. Lengths may be shorter than the requested
-/// counts on truncated input — callers should treat that as malformed.
+/// counts on truncated input - callers should treat that as malformed.
 #[allow(clippy::too_many_arguments)]
 fn read_func_params<'a>(
     type_data: &'a [u8],
@@ -1256,7 +1256,7 @@ fn read_func_params<'a>(
         return (Vec::new(), Vec::new());
     }
     // Params start after the (ptr-aligned) `funcType` struct, then after the
-    // `UncommonType` when present — Go places the inline parameter array *after*
+    // `UncommonType` when present - Go places the inline parameter array *after*
     // the uncommon block (`abi.FuncType.InSlice`), so skipping it here is what
     // keeps the parameter VAs (and the types they reach) correct.
     let uncommon_sz = if has_uncommon { UncommonType::SIZE } else { 0 };
@@ -1331,7 +1331,7 @@ fn resolve_concrete_methods<'a>(
         };
         // A concrete-type method always has a name. An empty / unresolved name
         // means `mcount` over-ran the real method array and the loop is now
-        // reading unrelated bytes — this happens when a stray reference is
+        // reading unrelated bytes - this happens when a stray reference is
         // mis-parsed as a type descriptor and its `UncommonType.mcount` is
         // garbage (e.g. `0xFFFF` read from padding). Stop rather than fabricate
         // thousands of empty methods. `mcount` cannot be bounded by a VA range

@@ -72,7 +72,7 @@ fn path_of(name: &str) -> &'static str {
 /// Read a fixture once per process and hand out a shared borrow.
 ///
 /// Benchmarks measure gobin, not the filesystem, so the read must not land
-/// inside the timed region — and it must not be re-counted by the allocation
+/// inside the timed region - and it must not be re-counted by the allocation
 /// profiler on every iteration either.
 fn fixture(path: &str) -> &'static [u8] {
     static CACHE: OnceLock<std::sync::Mutex<Vec<(String, &'static [u8])>>> = OnceLock::new();
@@ -98,7 +98,7 @@ fn parse(bencher: Bencher, name: &str) {
     bencher.bench(|| black_box(GoBinary::parse(black_box(data))).is_some());
 }
 
-/// Function enumeration with names and source files resolved — the most
+/// Function enumeration with names and source files resolved - the most
 /// commonly consumed surface.
 #[divan::bench(args = FIXTURES)]
 fn functions(bencher: Bencher, name: &str) {
@@ -123,7 +123,7 @@ fn all_types(bencher: Bencher, name: &str) {
     bencher.bench(|| black_box(bin.all_types().len()));
 }
 
-/// Go string-literal recovery — a full pointer-aligned sweep of the image.
+/// Go string-literal recovery - a full pointer-aligned sweep of the image.
 #[divan::bench(args = FIXTURES)]
 fn strings(bencher: Bencher, name: &str) {
     let data = fixture(path_of(name));
@@ -139,7 +139,7 @@ fn itabs(bencher: Bencher, name: &str) {
     bencher.bench(|| black_box(bin.itab_pairs().count()));
 }
 
-/// Inline-tree decoding over every function — the heaviest pclntab surface.
+/// Inline-tree decoding over every function - the heaviest pclntab surface.
 #[divan::bench(args = FIXTURES)]
 fn inline_trees(bencher: Bencher, name: &str) {
     let data = fixture(path_of(name));
@@ -194,7 +194,7 @@ fn init_order(bencher: Bencher, name: &str) {
     bencher.bench(|| black_box(bin.init_order().len()));
 }
 
-/// `//go:embed` payload recovery — a symbol-independent structural search.
+/// `//go:embed` payload recovery - a symbol-independent structural search.
 #[divan::bench(args = FIXTURES)]
 fn embeds(bencher: Bencher, name: &str) {
     let data = fixture(path_of(name));
@@ -202,7 +202,7 @@ fn embeds(bencher: Bencher, name: &str) {
     bencher.bench(|| black_box(bin.embedded_assets().len()));
 }
 
-/// A full metadata sweep — the shape of an actual triage run.
+/// A full metadata sweep - the shape of an actual triage run.
 #[divan::bench(args = FIXTURES)]
 fn full_sweep(bencher: Bencher, name: &str) {
     let data = fixture(path_of(name));

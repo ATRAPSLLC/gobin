@@ -1,4 +1,4 @@
-//! Go string header (`reflect.StringHeader`) layout — `(ptr, len)`, each
+//! Go string header (`reflect.StringHeader`) layout - `(ptr, len)`, each
 //! `uintptr`-sized. Unlike slices, strings have no capacity field.
 //!
 //! This module provides the low-level *header* type used by other parsers.

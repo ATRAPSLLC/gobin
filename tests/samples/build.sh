@@ -4,7 +4,7 @@
 #
 # ONE script for the whole corpus. It runs on a linux/amd64 host and is fully
 # self-contained: it downloads each released Go toolchain from go.dev on demand
-# — no system Go, no container engine, no gotip bootstrap. A linux host is used
+# - no system Go, no container engine, no gotip bootstrap. A linux host is used
 # because the pre-1.16 toolchains
 # have no darwin/arm64 build (and crash under qemu user-emulation), while every
 # modern format (Mach-O / PE / Wasm) cross-compiles cleanly from linux. The cgo
@@ -151,7 +151,7 @@ build() {
   # accepts `-gcflags=-trimpath=<dir>`, which strips the build dir so embedded
   # source paths reduce to "main.go" (the fixture programs are pure Go, so no
   # `-asmflags` is needed). Only Go 1.2's `6g` has neither and embeds the
-  # (fixed, build-cache) path — a single fixture, by necessity.
+  # (fixed, build-cache) path - a single fixture, by necessity.
   local flags=()
   if [[ "$m" -ge 13 ]]; then
     flags+=("-trimpath")
@@ -167,7 +167,7 @@ build() {
   done
 
   # Copy the whole program dir (so go:embed assets travel with main.go), but
-  # drop go.mod — every build runs in GOPATH mode (GO111MODULE=off) and a stray
+  # drop go.mod - every build runs in GOPATH mode (GO111MODULE=off) and a stray
   # module file would only confuse the older toolchains.
   rm -rf "$bdir"; mkdir -p "$bdir"
   cp -r "$SRC/$prog/." "$bdir/"; rm -f "$bdir/go.mod"
@@ -232,7 +232,7 @@ for entry in "${VERSIONS[@]}"; do
            # `.data.rel.ro.typelink`). Without a PIE fixture the section
            # classifier's prefix stripping is untested, and an unprefixed
            # lookup makes a PIE binary look like it has no typelink section at
-           # all — which the moduledata arbitration reads as a Go 1.27 signal.
+           # all - which the moduledata arbitration reads as a Go 1.27 signal.
            build "$tag" "$ver" basic   linux   amd64 "_pie" -buildmode=pie
            build "$tag" "$ver" minimal linux   amd64 ""
            build "$tag" "$ver" embed   linux   amd64 ""
@@ -252,7 +252,7 @@ done
 
 # A Go binary with every occurrence of its version string overwritten, the way
 # an obfuscator (garble) or a repacker leaves one. With no version to key on,
-# the moduledata parser has to pick its layout from structural evidence alone —
+# the moduledata parser has to pick its layout from structural evidence alone -
 # and on PE, which never carries a `.typelink` section, the only hint points at
 # the Go 1.27 layout. Guessing wrong there silently empties the types, itabs,
 # init tasks and inline tree, so this fixture pins the arbitration.

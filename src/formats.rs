@@ -51,7 +51,7 @@ use crate::{
 };
 
 /// Wasm section id of the Code section, which holds the module's function
-/// bodies — the wasm equivalent of `.text`.
+/// bodies - the wasm equivalent of `.text`.
 const WASM_CODE_SECTION_ID: u8 = 10;
 
 /// Wasm section id of the Data section, which holds every initialized byte of
@@ -71,7 +71,7 @@ pub enum BinaryFormat {
     /// PE (Portable Executable) -- Windows.
     /// Magic: `MZ` (`4d 5a`) DOS header.
     Pe,
-    /// WebAssembly module (`.wasm`) — produced by `GOOS=js GOARCH=wasm` (or
+    /// WebAssembly module (`.wasm`) - produced by `GOOS=js GOARCH=wasm` (or
     /// `wasip1` since Go 1.21).
     /// Magic: `\0asm` + version `01 00 00 00`.
     ///
@@ -80,7 +80,7 @@ pub enum BinaryFormat {
     /// translations make wasm look the same as the other formats to
     /// downstream parsers:
     ///
-    /// - `image_base` is `0` — linear-memory addresses are absolute.
+    /// - `image_base` is `0` - linear-memory addresses are absolute.
     /// - The Data section's many segments are reassembled into one
     ///   contiguous linear-memory image (with zero-fill gaps), and that
     ///   image becomes the address space [`BinaryContext::va_to_file`]
@@ -89,11 +89,11 @@ pub enum BinaryFormat {
     ///   in linear memory; the image presents them contiguously.
     ///
     /// The Go linker does not emit format-specific sections (`.gopclntab`
-    /// etc.) for wasm — only three custom sections: `go:buildid`,
+    /// etc.) for wasm - only three custom sections: `go:buildid`,
     /// `producers`, `name`. pclntab and buildinfo bytes live inside the
     /// Data-section linear-memory payload alongside the rest of the
     /// runtime's static data. `text_va` and `etext_va` here are runtime
-    /// "PC" boundaries — not byte offsets into the Code section — since
+    /// "PC" boundaries - not byte offsets into the Code section - since
     /// wasm encodes a Go PC as `(function_index << 16) | bytecode_offset`.
     Wasm,
     /// Unrecognized format. Magic-byte scanning can still find Go structures.
@@ -121,7 +121,7 @@ pub struct GoSections {
     pub go_module: Option<SectionRange>,
     /// File byte range of the typelink section (ELF / Mach-O, Go ≤ 1.26).
     /// Removed by Go 1.27, which replaced the typelink array with a walk over
-    /// the type-descriptor region — see [`Self::go_type`].
+    /// the type-descriptor region - see [`Self::go_type`].
     pub typelink: Option<SectionRange>,
     /// File byte range of the itablink section (ELF / Mach-O, Go ≤ 1.26).
     /// Removed by Go 1.27, which stores itabs inline in the types region.
@@ -133,7 +133,7 @@ pub struct GoSections {
     /// (which keeps everything in `.rdata`) and on wasm.
     pub go_type: Option<SectionRange>,
     /// File byte range of the `go:funcdesc` section (`.go.func` / `__go_func`,
-    /// Go 1.27+) — the `·f` function-value descriptors that used to sit in
+    /// Go 1.27+) - the `·f` function-value descriptors that used to sit in
     /// `.rodata`. Recorded as a Go 1.27 structural marker.
     pub go_func: Option<SectionRange>,
     /// File byte range of the FIPS-140 info section (`.go.fipsinfo` /
@@ -146,7 +146,7 @@ pub struct GoSections {
     /// is otherwise a whole-image sweep.
     pub noptrdata: Option<SectionRange>,
     /// File byte range of the initialized data section (`.data` / `__data`),
-    /// or — for wasm, which has no named sections — of the Data section
+    /// or - for wasm, which has no named sections - of the Data section
     /// payload. PE merges every Go data symbol into `.data`, so it is the PE
     /// equivalent of `noptrdata` for moduledata discovery.
     ///
@@ -180,7 +180,7 @@ pub struct SectionRange {
 ///
 /// Parses the executable format **once** (via `goblin`) during construction and
 /// provides zero-copy section slicing, VA-to-file-offset translation, and ELF
-/// note segment access. This is the low-level entry point — all Go metadata
+/// note segment access. This is the low-level entry point - all Go metadata
 /// parsers (pclntab, buildinfo, types, etc.) receive a `&BinaryContext` rather
 /// than re-parsing the binary independently.
 ///
@@ -203,7 +203,7 @@ pub struct BinaryContext<'a> {
     elf_note_segments: Vec<(usize, usize)>,
     /// Image base virtual address.
     ///
-    /// For PE binaries this is the `OptionalHeader.ImageBase` field — RVAs in
+    /// For PE binaries this is the `OptionalHeader.ImageBase` field - RVAs in
     /// the PE address space are relative to it. For ELF and Mach-O the field
     /// is `0`, since their addresses are already absolute VAs and "RVA"
     /// effectively coincides with VA. `Unknown` formats also report `0`.
@@ -219,7 +219,7 @@ pub struct BinaryContext<'a> {
     ///
     /// Owned by [`BinaryContext`] (no leak). Borrows handed out via
     /// [`Self::structure_search_data`] are tied to `&self` and live as long
-    /// as the context does — all parsers that build structures borrowing
+    /// as the context does - all parsers that build structures borrowing
     /// from the LM image (`ParsedPclntab`, `GoType`, etc.) borrow with the
     /// same `&self` lifetime.
     wasm_lm: Option<Box<[u8]>>,
@@ -235,7 +235,7 @@ impl<'a> BinaryContext<'a> {
     /// Parse a binary, extracting format info, Go sections, VA mappings, and ELF notes
     /// in a single `goblin` pass.
     ///
-    /// Always succeeds — returns a context with empty sections/segments if `goblin`
+    /// Always succeeds - returns a context with empty sections/segments if `goblin`
     /// cannot parse the data.
     pub fn new(data: &'a [u8]) -> Self {
         let format = detect_format(data);
@@ -259,7 +259,7 @@ impl<'a> BinaryContext<'a> {
         let mut elf_note_segments = Vec::new();
         let mut image_base: u64 = 0;
         // Mach-O segment `(vmaddr, fileoff)` in load-command order, and the
-        // `LC_DYLD_CHAINED_FIXUPS` data offset — both needed to rebase chained
+        // `LC_DYLD_CHAINED_FIXUPS` data offset - both needed to rebase chained
         // fixups in externally-linked objects (plugins / CGO / c-shared).
         let mut macho_segments: Vec<(u64, u64)> = Vec::new();
         let mut chained_fixups_off: Option<usize> = None;
@@ -306,7 +306,7 @@ impl<'a> BinaryContext<'a> {
                 }
             }
             BinaryFormat::MachO => {
-                // `MachO::parse(.., 0)` handles a thin (non-fat) Mach-O — the
+                // `MachO::parse(.., 0)` handles a thin (non-fat) Mach-O - the
                 // only Mach variant the original `Mach::Binary` arm processed.
                 if let Ok(macho) = MachO::parse(data, 0) {
                     // Locate the chained-fixups load command, if present.
@@ -316,7 +316,7 @@ impl<'a> BinaryContext<'a> {
                         }
                     }
                     for seg in &macho.segments {
-                        // Per-segment (vmaddr, fileoff) in load order — the
+                        // Per-segment (vmaddr, fileoff) in load order - the
                         // fixup chains index segments by this order.
                         macho_segments.push((seg.vmaddr, seg.fileoff));
                         // VA mapping
@@ -343,7 +343,7 @@ impl<'a> BinaryContext<'a> {
             BinaryFormat::Pe => {
                 // We read only the optional header's image base and the
                 // section table. Disable goblin's resource, import,
-                // certificate, and TLS parsing — Go binaries can carry large
+                // certificate, and TLS parsing - Go binaries can carry large
                 // import/resource tables we never touch, and skipping them is
                 // a straight efficiency win with no effect on what we use.
                 let opts = ParseOptions::default()
@@ -394,7 +394,7 @@ impl<'a> BinaryContext<'a> {
             for sec in walk_wasm_sections(data) {
                 if sec.id == 0 && sec.name == Some("go:buildid") {
                     // Presence is a hard signal that the Go linker produced
-                    // this binary. Reuse the existing flag — buildid extract
+                    // this binary. Reuse the existing flag - buildid extract
                     // falls through to the raw-marker scan and finds the
                     // payload bytes inside the section.
                     sections.has_go_buildid_note = true;
@@ -402,7 +402,7 @@ impl<'a> BinaryContext<'a> {
                 if sec.id == WASM_CODE_SECTION_ID && sec.payload_size > 0 {
                     // The Code section is wasm's executable region. Recorded
                     // under `text_section` so the structural searches skip it
-                    // exactly as they skip `.text` elsewhere — it is the
+                    // exactly as they skip `.text` elsewhere - it is the
                     // largest part of a Go wasm module and can hold none of
                     // the data structures they look for.
                     sections.text_section = Some(SectionRange {
@@ -431,7 +431,7 @@ impl<'a> BinaryContext<'a> {
                 // Register the linear-memory image as a single VA mapping.
                 // This makes `va_to_file(va) == va`, so every code path that
                 // does `structure_search_data()[va_to_file(va)..]` reads
-                // contiguous bytes across wasm data-segment boundaries —
+                // contiguous bytes across wasm data-segment boundaries -
                 // gaps are zero-fill in the reconstructed image.
                 let lm_len = image.len() as u64;
                 segments.push((0u64, 0u64, lm_len));
@@ -466,7 +466,7 @@ impl<'a> BinaryContext<'a> {
         }
     }
 
-    /// Byte ranges of [`Self::data`] — i.e. **file** offsets — that can hold
+    /// Byte ranges of [`Self::data`] - i.e. **file** offsets - that can hold
     /// Go data structures, in order and non-overlapping.
     ///
     /// Callers that search through [`Self::structure_search_data`] want
@@ -474,7 +474,7 @@ impl<'a> BinaryContext<'a> {
     /// offsets.
     ///
     /// Several extraction surfaces have no symbol to look up and must search
-    /// memory structurally — the build-info blob, `embed.FS` file arrays, the
+    /// memory structurally - the build-info blob, `embed.FS` file arrays, the
     /// moduledata. All of them are *data*, so the two largest regions of a Go
     /// binary can be excluded outright: the executable section (`.text`,
     /// `__text`, or a wasm Code section) and the pclntab, which is a
@@ -508,13 +508,13 @@ impl<'a> BinaryContext<'a> {
     }
 
     /// The same idea as [`Self::data_regions`], but as ranges into
-    /// [`Self::structure_search_data`] — the view every structural parser
+    /// [`Self::structure_search_data`] - the view every structural parser
     /// actually reads through.
     ///
     /// For ELF, Mach-O and PE that view is the file (or, for a chained-fixup
     /// Mach-O, a rebased copy with identical layout), so the file ranges carry
     /// over unchanged. For wasm it is the reconstructed linear-memory image,
-    /// whose offsets are linear-memory addresses unrelated to file positions —
+    /// whose offsets are linear-memory addresses unrelated to file positions -
     /// and which is *entirely* initialized data, so there is nothing to
     /// exclude.
     pub fn search_regions(&self) -> Vec<(usize, usize)> {
@@ -585,7 +585,7 @@ impl<'a> BinaryContext<'a> {
     ///
     /// For wasm this is the reconstructed linear-memory image (covering all
     /// data segments laid out at their target offsets, with zero-fill in
-    /// between). For every other format this is the file bytes — wasm is the
+    /// between). For every other format this is the file bytes - wasm is the
     /// only one where Go runtime structures span multiple disjoint regions.
     ///
     /// Offsets returned by [`Self::va_to_file`] index into this slice for
@@ -684,7 +684,7 @@ pub fn detect_format(data: &[u8]) -> BinaryFormat {
 /// rename every read-only-relocatable Go section with a `.data.rel.ro` prefix
 /// (`cmd/link/internal/ld/data.go`, `genrelrosecname`), so `.typelink` becomes
 /// `.data.rel.ro.typelink` and `.go.type` becomes `.data.rel.ro.go.type`. The
-/// prefix is stripped before matching — otherwise a PIE binary looks like it
+/// prefix is stripped before matching - otherwise a PIE binary looks like it
 /// has no typelink section at all, which the moduledata layout arbitration
 /// reads as a Go 1.27 signal.
 fn classify_section(name: &str, range: Option<SectionRange>, result: &mut GoSections) {

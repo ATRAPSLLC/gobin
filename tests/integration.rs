@@ -485,7 +485,7 @@ mod strings_and_inline {
 
     #[test]
     fn strings_iter_works_on_stripped_binaries() {
-        // Strings live in rodata, not in DWARF or symbol tables — should
+        // Strings live in rodata, not in DWARF or symbol tables - should
         // survive `-ldflags='-s -w'` unchanged.
         let normal = {
             let d = load(BASIC_NORMAL);
@@ -497,7 +497,7 @@ mod strings_and_inline {
             let bin = GoBinary::parse(&d).unwrap();
             bin.strings().count()
         };
-        // Should be very close — within 5% (stripping shouldn't materially affect rodata).
+        // Should be very close - within 5% (stripping shouldn't materially affect rodata).
         let diff = (normal as i64 - stripped as i64).abs();
         let bound = (normal / 20).max(10);
         assert!(
@@ -543,7 +543,7 @@ mod strings_and_inline {
             }
         }
         assert!(total > 100, "expected many string hits, got {total}");
-        // We intentionally don't assert non_utf8 > 0 — a stdlib hello binary
+        // We intentionally don't assert non_utf8 > 0 - a stdlib hello binary
         // may not contain any. The point is the API doesn't drop them.
         let _ = (utf8_ok, non_utf8);
     }
@@ -776,7 +776,7 @@ mod buildinfo {
 }
 
 // ===========================================================================
-// `moduledata` surfaces — segments, GC pointer maps, itabs, coverage, init
+// `moduledata` surfaces - segments, GC pointer maps, itabs, coverage, init
 // ===========================================================================
 mod moduledata {
     use super::*;
@@ -831,7 +831,7 @@ mod moduledata {
 
     /// `-buildmode=pie` renames every read-only-relocatable Go section with a
     /// `.data.rel.ro` prefix. If the classifier does not strip it, a PIE binary
-    /// looks like it has no type sections at all — which for Go ≤1.26 is read
+    /// looks like it has no type sections at all - which for Go ≤1.26 is read
     /// as a Go 1.27 signal, and for 1.27 loses the positive `.go.type` signal.
     #[test]
     fn pie_relro_section_names_are_recognized() {
@@ -856,7 +856,7 @@ mod moduledata {
 
     /// Go 1.26 stopped writing `textStart` into the pcHeader, leaving the slot
     /// zeroed. A moduledata-less 1.26+ binary must not report `runtime.text` as
-    /// address 0 — that turns every entry VA into a raw `entry_off` without any
+    /// address 0 - that turns every entry VA into a raw `entry_off` without any
     /// error surfacing.
     #[test]
     fn text_va_is_never_zero() {
@@ -1168,7 +1168,7 @@ mod embed_and_fips {
 
     /// `embed.FS` recovery reads through the address-space view, which for
     /// wasm is the reconstructed linear-memory image rather than the file.
-    /// Narrowing that search with file-offset section ranges finds nothing —
+    /// Narrowing that search with file-offset section ranges finds nothing -
     /// silently, since a binary with no embeds legitimately returns empty.
     #[test]
     fn embedded_assets_recovered_from_wasm() {
@@ -1310,7 +1310,7 @@ mod wasm {
     fn wasm_arch_resolves_correctly() {
         let data = load(BASIC_WASM);
         let bin = GoBinary::parse(&data).unwrap();
-        // pclntab arch can't disambiguate (1,8) — reports X86_64.
+        // pclntab arch can't disambiguate (1,8) - reports X86_64.
         assert_eq!(bin.pclntab().unwrap().arch(), Arch::X86_64);
         // bin.arch() folds in the container format and resolves to Wasm.
         assert_eq!(bin.arch(), Arch::Wasm);
@@ -1405,9 +1405,9 @@ mod wasm {
 mod types {
     use super::*;
 
-    /// `abi.MapType` has shipped three different shapes — bucket-based `hmap`
+    /// `abi.MapType` has shipped three different shapes - bucket-based `hmap`
     /// (≤1.23), Swiss tables (1.24-1.26), and Swiss with explicit key/elem
-    /// strides (1.27+) — and each descriptor's size feeds the position of its
+    /// strides (1.27+) - and each descriptor's size feeds the position of its
     /// trailing `UncommonType`. Sweep the corpus and assert every map
     /// descriptor is read with the layout its Go version actually emitted, with
     /// the version-specific fields populated and the others genuinely absent.
@@ -1545,7 +1545,7 @@ mod types {
     /// Go 1.27 replaced the typelink table with a walk bounded by
     /// `moduledata.typedesclen`. Walking to `etypes` instead runs off the end
     /// of the typelink descriptors into non-typelink types, `type:.namedata.*`
-    /// blobs, and finally the inline itab array — surfacing unnamed junk types.
+    /// blobs, and finally the inline itab array - surfacing unnamed junk types.
     #[test]
     fn v5_type_walk_stops_at_typedesclen() {
         use gobin::structures::moduledata::ModuledataVersion;
@@ -1578,7 +1578,7 @@ mod types {
                 );
                 assert!(
                     !t.name.is_empty(),
-                    "{}: unnamed type at {:#x} — the walk over-ran its bound",
+                    "{}: unnamed type at {:#x} - the walk over-ran its bound",
                     f.path,
                     t.descriptor_va
                 );
@@ -1790,7 +1790,7 @@ mod types {
                     if let Some(tag) = f.tag {
                         tagged += 1;
                         // Conventional `key:"value"` tags (e.g. json/yaml) appear in
-                        // stdlib structs — at least one should decode cleanly.
+                        // stdlib structs - at least one should decode cleanly.
                         if tag.contains(":\"") {
                             saw_keyvalue_tag = true;
                         }
@@ -1809,29 +1809,29 @@ mod types {
         // produced a garbage `mcount`; resolving those phantom methods followed
         // garbage `mtyp` offsets and exploded the transitive closure. Real Go types
         // have at most ~150 methods, and this fixture's legitimate closure is ~850
-        // types — neither bound is tight, but each is far below the bug's output
+        // types - neither bound is tight, but each is far below the bug's output
         // (mcount up to 0xFFFF; ~12.8k inflated types).
         for t in &all {
             assert!(
                 t.method_count < 500,
-                "absurd method_count {} on type {:?} — UncommonType mis-located?",
+                "absurd method_count {} on type {:?} - UncommonType mis-located?",
                 t.method_count,
                 t.name
             );
         }
         assert!(
             all.len() < 3000,
-            "all_types inflated to {} — garbage method offsets being followed?",
+            "all_types inflated to {} - garbage method offsets being followed?",
             all.len()
         );
         // The transitive walk reaches the binary's own tagged structs and decodes
-        // their field tags — covering json, yaml, multi-key, and `,omitempty`.
+        // their field tags - covering json, yaml, multi-key, and `,omitempty`.
         //
         // (This previously asserted ">20" tagged fields. That count was an artifact
         // of a func-type descriptor bug: the `UncommonType` for func types was
         // located short by the funcType struct's alignment padding, so a garbage
         // `mcount` was read and the phantom methods' garbage `mtyp` offsets were
-        // followed into ~12k unrelated descriptors — inflating `all_types` from the
+        // followed into ~12k unrelated descriptors - inflating `all_types` from the
         // ~850 genuinely-reachable types to ~12.8k and surfacing stdlib structs not
         // actually reachable from typelinks. With the layout fixed, the walk reaches
         // only legitimately-referenced types.)
@@ -1925,7 +1925,7 @@ mod types {
         // A stdlib-linked binary has plenty of named struct fields and func params;
         // the leaf (concrete) referenced types should resolve to names. Method /
         // interface-method signature types are unnamed Go func types, so their
-        // `type_name` is expectedly None — covered by the doc contract, not here.
+        // `type_name` is expectedly None - covered by the doc contract, not here.
         assert!(resolved_field, "expected some struct field type names");
         assert!(resolved_param, "expected some func param type names");
         assert!(
@@ -2120,7 +2120,7 @@ mod types {
         let data = load(BASIC_NORMAL);
         let bin = GoBinary::parse(&data).unwrap();
 
-        // bin.types() is a streaming iterator — verify it composes with .take() /
+        // bin.types() is a streaming iterator - verify it composes with .take() /
         // .count() and yields a positive number of types.
         let count = bin.types().count();
         assert!(count > 0, "binary should expose at least one type");
@@ -2146,7 +2146,7 @@ mod types {
         assert_eq!(format!("{}", PclntabVersion::Go118), "go118");
         assert_eq!(format!("{}", PclntabVersion::Go120), "go120");
 
-        // Arch — values match canonical GOARCH where they exist
+        // Arch - values match canonical GOARCH where they exist
         assert_eq!(format!("{}", Arch::X86), "386");
         assert_eq!(format!("{}", Arch::X86_64), "amd64");
         assert_eq!(format!("{}", Arch::Arm64), "arm64");
@@ -2277,7 +2277,7 @@ mod types {
 //
 // Fixtures are discovered by filename
 // (`<prog>_go<minor>_<goos>_<goarch>[_variant][.exe]`), so the whole corpus
-// built by `tests/samples/build.sh` is swept automatically — adding a build
+// built by `tests/samples/build.sh` is swept automatically - adding a build
 // line extends coverage with no test edits. The `basic` program is byte-for-
 // byte identical source on every Go release from 1.2 onward, so the assertions
 // below hold uniformly across the entire version range.
@@ -2523,7 +2523,7 @@ mod matrix {
                     files.insert(s.to_string());
                 }
             }
-            // Bounded and populated — the legacy-misparse bug produced millions.
+            // Bounded and populated - the legacy-misparse bug produced millions.
             assert!(
                 (10..5000).contains(&packages.len()),
                 "{}: package count {} out of range",
@@ -2541,8 +2541,8 @@ mod matrix {
             }
             // No package name carries control bytes or non-ASCII garbage. (Some
             // compiler-generated symbols like `type..eq.struct {...}` legitimately
-            // contain spaces and braces, so only control/non-ASCII bytes — the
-            // signature of the original misparse — are rejected.)
+            // contain spaces and braces, so only control/non-ASCII bytes - the
+            // signature of the original misparse - are rejected.)
             for p in &packages {
                 assert!(
                     p.bytes().all(|b| b.is_ascii() && !b.is_ascii_control()),
@@ -2907,9 +2907,9 @@ mod harness {
                 }
             }
             // Every structural detail the extractor enumerates from typelinks.
-            // (Bare interface type descriptors are not enumerated here — they
+            // (Bare interface type descriptors are not enumerated here - they
             // are reachable only via itabs and pointer/elem references, asserted
-            // through `itab_pairs` below — so "interface" is not in this set.)
+            // through `itab_pairs` below - so "interface" is not in this set.)
             for k in ["struct", "map", "chan", "slice", "array", "pointer", "func"] {
                 assert!(kinds.contains(k), "{path}: missing TypeDetail kind {k}");
             }
@@ -2923,8 +2923,8 @@ mod harness {
                 );
             }
             // NOTE: named tagged structs (Record) are enumerated only in their
-            // `*main.Record` pointer form; the underlying struct descriptor —
-            // with field names, tags, and the embedded flag — is referenced via
+            // `*main.Record` pointer form; the underlying struct descriptor -
+            // with field names, tags, and the embedded flag - is referenced via
             // `elem_va` but not yielded by `bin.types()`. Field-tag/embedded
             // extraction is therefore not asserted here (see TODO C-06).
             assert!(saw_variadic_func, "{path}: variadic func type not surfaced");

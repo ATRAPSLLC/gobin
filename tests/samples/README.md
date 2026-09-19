@@ -41,7 +41,7 @@ detect (one `basic_go<minor>_linux_amd64` fixture per row, plus the variants):
 | `go127`             | Go120   | V5         | inline itabs, no typelinks, `.go.type`/`.go.func` sections |
 
 The corpus separately pins the `abi.MapType` layout, which has changed **six**
-times and is not tied to the moduledata version — so each era needs its own
+times and is not tied to the moduledata version - so each era needs its own
 fixture. The integration test `types::map_descriptors_use_the_layout_of_their_go_version`
 sweeps the whole corpus and additionally asserts that all six eras are present,
 so this coverage cannot be lost silently:
@@ -61,25 +61,25 @@ normalizes them; `go120` (`hashMightPanic` on an interface-keyed map) and
 
 ## Programs (sources under `src/`)
 
-- `src/basic/` — the primary fixture, **byte-for-byte source-identical across
+- `src/basic/` - the primary fixture, **byte-for-byte source-identical across
   every Go release from 1.2**: `main.main`, `main.worker`,
   `main.(*TestStruct).DoSomething` (both `//go:noinline` so the symbols survive
   every version), interfaces with multiple implementors (itabs), a goroutine +
   channel, `defer`, a closure, struct tags, `fmt`/`reflect`/`strings`. Also the
   source for the `_cover`, `_fips`, and wasm fixtures.
-- `src/types/` — the full type-descriptor zoo: every `TypeDetail` kind
+- `src/types/` - the full type-descriptor zoo: every `TypeDetail` kind
   (struct/map/chan-all-directions/slice/array/pointer/func-variadic) funnelled
   through `reflect.TypeOf` so each descriptor is reachable.
-- `src/generics/` — Go generics (≥1.18): generic functions and types
+- `src/generics/` - Go generics (≥1.18): generic functions and types
   instantiated at multiple concrete types (`//go:noinline`), so the
   shape-stenciled instantiations (`main.Sum[go.shape.int]`,
   `main.(*Stack[…]).Push`, `main.Pair[string,int]`) are emitted.
-- `src/cgo/` — a CGO build (`CGO_ENABLED=1`, needs host `gcc`), exercising the
+- `src/cgo/` - a CGO build (`CGO_ENABLED=1`, needs host `gcc`), exercising the
   `_cgo_*` / `_Cfunc_*` shim symbols and the `CGO_ENABLED` build setting.
-- `src/embed/` — `//go:embed assets/*` (multi-file `embed.FS` with a nested dir
+- `src/embed/` - `//go:embed assets/*` (multi-file `embed.FS` with a nested dir
   and a binary blob) plus a single-file `//go:embed` string.
-- `src/minimal/` — smallest useful program (no `fmt`); near-empty metadata.
-- `src/plugin/` — a `-buildmode=plugin` Go plugin. Built natively on darwin
+- `src/minimal/` - smallest useful program (no `fmt`); near-empty metadata.
+- `src/plugin/` - a `-buildmode=plugin` Go plugin. Built natively on darwin
   (CGO) it is a Mach-O dylib using **chained fixups**
   (`plugin_go126_darwin_arm64.so`); see below.
 
@@ -88,17 +88,17 @@ normalizes them; `go120` (`hashMightPanic` on an interface-keyed map) and
 Two fixtures exist to cover inputs a triage pipeline actually sees, where the
 parser cannot fall back on the usual markers:
 
-- **`basic_go127_linux_amd64_pie`** — `-buildmode=pie` prefixes every
+- **`basic_go127_linux_amd64_pie`** - `-buildmode=pie` prefixes every
   read-only-relocatable Go section with `.data.rel.ro`
   (`.data.rel.ro.go.type`, and pre-1.27 `.data.rel.ro.typelink`). Without the
   prefix stripping in `formats::classify_section`, a PIE binary looks like it
   has no type sections at all.
-- **`embed_go127_wasip1_wasm`** — the only fixture where the address-space
+- **`embed_go127_wasip1_wasm`** - the only fixture where the address-space
   view is not the file. `embed.FS` recovery searches the reconstructed
   linear-memory image, so any attempt to narrow that search with file-offset
-  section ranges finds nothing — silently, because a binary with no embeds
+  section ranges finds nothing - silently, because a binary with no embeds
   legitimately returns an empty list.
-- **`basic_go124_windows_amd64_noversion.exe`** — a byte-identical copy of
+- **`basic_go124_windows_amd64_noversion.exe`** - a byte-identical copy of
   `basic_go124_windows_amd64.exe` with every `go1.24` literal zeroed, the way an
   obfuscator leaves one. PE never carries a `.typelink` section at any Go
   version, so with no version string the only layout hint points at the Go 1.27
@@ -110,7 +110,7 @@ parser cannot fall back on the usual markers:
 
 `build.sh` is the single, self-contained builder. It runs on a **linux/amd64
 host** (e.g. `ssh dev-linux`) and downloads each Go toolchain from go.dev on
-demand — no system Go, no container engine, no `golang.org/dl` helpers. A linux
+demand - no system Go, no container engine, no `golang.org/dl` helpers. A linux
 host is required because the pre-1.16 toolchains have no darwin/arm64 build (and
 crash under qemu user-emulation), while every modern format cross-compiles
 cleanly from linux.
@@ -131,8 +131,8 @@ One fixture needs a host the script cannot assume:
   ```
 
 Embedded source paths are trimmed so no build-host paths leak in: Go ≥1.13 uses
-the `-trimpath` build flag, and Go 1.4–1.12 use `-gcflags=-trimpath=<dir>` (the
+the `-trimpath` build flag, and Go 1.4-1.12 use `-gcflags=-trimpath=<dir>` (the
 fixture programs are pure Go), both reducing the path to `main.go` /
 `command-line-arguments/main.go` / `./main.go`. Only **Go 1.2** (`go12`) embeds
-the build-cache path — its `6g` compiler predates path trimming entirely.
+the build-cache path - its `6g` compiler predates path trimming entirely.
 Tests match source files by basename, so the exact form is irrelevant.

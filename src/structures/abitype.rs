@@ -16,13 +16,13 @@
 //! - `FieldAlign_` (u8)
 //! - `Kind_`       (u8)
 //! - `Equal`       (uintptr, equality function pointer)
-//! - `GCData`      (uintptr, GC pointer-mask bitmap — or a pointer to one; see
+//! - `GCData`      (uintptr, GC pointer-mask bitmap - or a pointer to one; see
 //!   [`TFLAG_GC_MASK_ON_DEMAND`])
 //! - `Str`         (NameOff / i32)
 //! - `PtrToThis`   (TypeOff / i32)
 //!
 //! Source: `src/internal/abi/type.go`. The struct itself has been stable since
-//! Go 1.21; what changed in Go 1.27 is how `GCData` is populated — see
+//! Go 1.21; what changed in Go 1.27 is how `GCData` is populated - see
 //! [`TFLAG_GC_MASK_ON_DEMAND`].
 
 use crate::structures::util::{read_i32, read_u32, read_uintptr};
@@ -40,7 +40,7 @@ pub const TFLAG_NAMED: u8 = 0x04;
 /// memory (`TFlagRegularMemory`).
 pub const TFLAG_REGULAR_MEMORY: u8 = 0x08;
 
-/// `TFlag` bit: `GCData` is **not** a pointer mask but a `**byte` — a slot the
+/// `TFlag` bit: `GCData` is **not** a pointer mask but a `**byte` - a slot the
 /// runtime fills in with a lazily-built mask on first use
 /// (`runtime.getGCMaskOnDemand`).
 ///

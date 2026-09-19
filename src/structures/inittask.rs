@@ -1,4 +1,4 @@
-//! `inittasks` decoder — recovers package initialization order.
+//! `inittasks` decoder - recovers package initialization order.
 //!
 //! The linker builds `moduledata.inittasks` (`[]*initTask`, Go 1.24+): the
 //! ordered list of package-init work the runtime runs at startup. Each entry
@@ -16,7 +16,7 @@
 //!
 //! Each function pointer is the entry VA of an init function (`pkg.init`,
 //! `pkg.init.0`, …). Resolving those VAs back to names (done by the caller via
-//! the pclntab function table) yields a readable startup order — useful for
+//! the pclntab function table) yields a readable startup order - useful for
 //! understanding droppers' persistence / staging behaviour.
 
 use crate::{

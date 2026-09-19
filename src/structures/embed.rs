@@ -93,8 +93,8 @@ pub fn extract<'a>(ctx: &'a BinaryContext<'a>, ptr_size: u8) -> Vec<EmbeddedAsse
 ///
 /// The three words of a `(ptr, len, cap)` header are consecutive, so the walk
 /// keeps a rolling window and reads each word once rather than once per
-/// candidate position, and tests `len`/`cap` — by far the more selective
-/// fields — before looking at the pointer.
+/// candidate position, and tests `len`/`cap` - by far the more selective
+/// fields - before looking at the pointer.
 #[allow(clippy::too_many_arguments)]
 fn scan_region<'a>(
     ctx: &'a BinaryContext<'a>,
@@ -222,7 +222,7 @@ fn parse_file_array<'a>(
 ///
 /// Mirrors `embed.split`: strip a trailing `/`, then split at the last
 /// remaining `/` (a missing dir becomes `"."`). Borrowed from `name` rather
-/// than owned — the key exists only to be compared against its predecessor,
+/// than owned - the key exists only to be compared against its predecessor,
 /// and the blind scan evaluates it for every candidate entry it examines, so
 /// owning it allocated twice per rejected entry.
 fn embed_sort_key(name: &str) -> (&str, &str) {

@@ -38,11 +38,11 @@ use crate::structures::PclntabVersion;
 /// Consumers persist this enum into long-lived schemas (database columns,
 /// structured logs). The contract:
 ///
-/// - **Variants** — append-only. New tiers appear as new variants; existing
+/// - **Variants** - append-only. New tiers appear as new variants; existing
 ///   variants are never renamed or removed.
-/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+/// - **`Display` strings** (and [`Self::as_str`]) - fixed forever once
 ///   shipped. Treat them as serialization keys.
-/// - **`Debug` strings** — *not* a stability surface. Use `Display` /
+/// - **`Debug` strings** - *not* a stability surface. Use `Display` /
 ///   `as_str` for anything that lands in a database column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
@@ -132,7 +132,7 @@ pub enum ConfidenceSignal {
     /// ELF `.note.go.buildid` (or `Go\0\0` note marker) was present.
     BuildidNotePresent,
     /// A Go type-metadata section was present. These names are unique to the
-    /// Go linker, so any of them is structural proof on its own — useful on
+    /// Go linker, so any of them is structural proof on its own - useful on
     /// stripped binaries where `.gopclntab` was renamed away.
     TypeSectionPresent {
         /// Which section matched, in its ELF spelling (`".typelink"`,

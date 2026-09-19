@@ -41,7 +41,7 @@ use crate::{
 ///
 /// Covers all three spellings the runtime has used: `runtime` itself,
 /// `runtime/<sub>` (e.g. `runtime/cgo`, and the pre-1.24 `runtime/internal/*`
-/// tree), and `internal/runtime/<sub>` — the home the runtime's internal
+/// tree), and `internal/runtime/<sub>` - the home the runtime's internal
 /// packages (`internal/runtime/atomic`, `internal/runtime/maps`,
 /// `internal/runtime/sys`, …) moved to in Go 1.24 and where they still live in
 /// 1.27. Without the third form, half the runtime of a modern binary
@@ -83,10 +83,10 @@ pub fn is_stdlib_path(pkg: &str) -> bool {
 pub enum Compiler {
     /// The standard `gc` compiler (the default Go toolchain).
     Gc,
-    /// TinyGo — produces small embedded/wasm binaries with a different runtime.
+    /// TinyGo - produces small embedded/wasm binaries with a different runtime.
     /// TinyGo binaries do not carry a stdlib pclntab.
     TinyGo,
-    /// Gccgo — GCC's Go front-end. Produces no pclntab.
+    /// Gccgo - GCC's Go front-end. Produces no pclntab.
     Gccgo,
     /// Could not determine (no `-compiler` setting and no distinguishing
     /// markers were found).
@@ -111,7 +111,7 @@ pub struct DepEntry<'a> {
 
 /// Replacement target for a [`DepEntry`].
 ///
-/// Records what the original module was substituted with — either a forked
+/// Records what the original module was substituted with - either a forked
 /// module (`=> github.com/forked/foo v1.2.3 h1:xyz=`) or a local path
 /// (`=> ./local/foo`, in which case `version` is typically `None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,11 +134,11 @@ pub struct DepReplacement<'a> {
 /// Consumers persist this enum into long-lived schemas (database columns,
 /// structured logs). The contract:
 ///
-/// - **Variants** — append-only. New obfuscators appear as new variants;
+/// - **Variants** - append-only. New obfuscators appear as new variants;
 ///   existing variants are never renamed or removed.
-/// - **`Display` strings** (and [`Self::kind_str`]) — fixed forever once
+/// - **`Display` strings** (and [`Self::kind_str`]) - fixed forever once
 ///   shipped. Treat them as serialization keys.
-/// - **`Debug` strings** — *not* a stability surface. Use `Display` /
+/// - **`Debug` strings** - *not* a stability surface. Use `Display` /
 ///   `kind_str` for anything that lands in a database column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObfuscationKind {
@@ -162,7 +162,7 @@ impl ObfuscationKind {
     /// Stable lowercase identifier for this verdict
     /// (`"none"` / `"garble"` / `"other"`).
     ///
-    /// Drops the inner `confidence` and `reason` payloads — read those off
+    /// Drops the inner `confidence` and `reason` payloads - read those off
     /// the matched variant directly. See the `# Stability` section on
     /// [`ObfuscationKind`] for the durability contract.
     pub fn kind_str(&self) -> &'static str {
@@ -190,7 +190,7 @@ impl std::fmt::Display for ObfuscationKind {
 /// setting, recorded in build info. The `__go_fipsinfo` section's integrity
 /// sum (the `go:fipsinfo` symbol, `struct { Magic [16]byte; Sum [32]byte }`)
 /// is present in *every* crypto-linked binary, so it alone does **not**
-/// indicate FIPS mode — it's exposed here only as a content identifier for
+/// indicate FIPS mode - it's exposed here only as a content identifier for
 /// the embedded crypto module.
 ///
 /// [`crate::GoBinary::fips_info`] returns this only when `GOFIPS140` is set;
@@ -204,7 +204,7 @@ pub struct FipsInfo<'a> {
     /// The `GOFIPS140` build-setting value (e.g. `"v1.0.0"` or
     /// `"v1.0.0-c2097c7c"`).
     pub version: &'a str,
-    /// Whether `fips140=on` appears in `DefaultGODEBUG` — i.e. FIPS
+    /// Whether `fips140=on` appears in `DefaultGODEBUG` - i.e. FIPS
     /// enforcement is active by default at runtime (vs. `fips140=only`/opt-in).
     pub enforced_by_default: bool,
     /// The 32-byte integrity sum from `__go_fipsinfo`, when the section is
@@ -473,12 +473,12 @@ fn package_boundary(name: &str) -> Option<usize> {
 /// Consumers persist this enum into long-lived schemas (database columns,
 /// structured logs). The contract:
 ///
-/// - **Variants** — append-only. New build modes appear as new variants;
+/// - **Variants** - append-only. New build modes appear as new variants;
 ///   existing variants are never renamed or removed.
-/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+/// - **`Display` strings** (and [`Self::as_str`]) - fixed forever once
 ///   shipped. They round-trip through [`Self::parse`]; treat them as
 ///   serialization keys.
-/// - **`Debug` strings** — *not* a stability surface. Use `Display` /
+/// - **`Debug` strings** - *not* a stability surface. Use `Display` /
 ///   `as_str` for anything that lands in a database column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildMode {
@@ -640,7 +640,7 @@ impl<'a> BuildInfo<'a> {
     /// any active `replace` directive (`=> path[ version][ h1:sum]`).
     ///
     /// This surfaces the supply-chain detail that [`Self::dependencies`]
-    /// collapses — e.g. answering "is this binary using the official
+    /// collapses - e.g. answering "is this binary using the official
     /// `golang.org/x/crypto` or a forked/replaced one?".
     pub fn deps_full(&self) -> impl Iterator<Item = &DepEntry<'a>> + '_ {
         self.deps.iter()
@@ -752,7 +752,7 @@ impl FunctionInfo<'_> {
 
     /// The short name (without package prefix).
     ///
-    /// Mirrors [`Self::package`] — both use the same boundary computation.
+    /// Mirrors [`Self::package`] - both use the same boundary computation.
     /// E.g. `"github.com/spf13/cobra.(*Command).Run"` -> `"(*Command).Run"`,
     /// `"gopkg.in/yaml.v3.Marshal"` -> `"Marshal"`.
     pub fn short_name(&self) -> &str {
@@ -765,14 +765,14 @@ impl FunctionInfo<'_> {
     /// Whether this function is a method (has a receiver type).
     ///
     /// A method has the form `<package>.<receiver>.<method>` where
-    /// `<receiver>` is either `(*?Type[generics?])` (parenthesized — pointer
+    /// `<receiver>` is either `(*?Type[generics?])` (parenthesized - pointer
     /// or complex receiver) or a bare identifier with optional generic args.
     /// This parses the structure rather than using a substring heuristic, so
     /// it correctly identifies value-receiver methods like `time.Time.String`
     /// that the old `".("` heuristic missed.
     ///
     /// Closures (`pkg.parent.funcN`) and gowrap stubs (`pkg.parent.gowrapN`)
-    /// look structurally like methods but are excluded — see [`Self::is_closure`].
+    /// look structurally like methods but are excluded - see [`Self::is_closure`].
     pub fn is_method(&self) -> bool {
         if self.is_closure() {
             return false;
@@ -854,7 +854,7 @@ impl FunctionInfo<'_> {
     /// Whether this function runs on the system stack (`FuncIDsystemstack` /
     /// `FuncIDsystemstack_switch`).
     ///
-    /// Inferred from [`Self::func_id`], not from `flag` — the runtime tracks
+    /// Inferred from [`Self::func_id`], not from `flag` - the runtime tracks
     /// systemstack by ID rather than a flag bit.
     pub fn is_systemstack(&self) -> bool {
         matches!(self.func_id, 98 | 99)
@@ -865,7 +865,7 @@ impl FunctionInfo<'_> {
     /// The Go compiler emits closures with names of the form
     /// `parent.funcN` (and similarly `parent.gowrapN` for goroutine wrappers
     /// around method calls), where `N` is a positive integer. This checks
-    /// the structural suffix shape — not the substring `.func` — and excludes
+    /// the structural suffix shape - not the substring `.func` - and excludes
     /// hand-written assembly (which never produces closures and could
     /// otherwise share textual patterns).
     pub fn is_closure(&self) -> bool {
@@ -917,7 +917,7 @@ impl FunctionInfo<'_> {
 
 /// Strongly-typed view of the `_func.flag` byte.
 ///
-/// Source: `src/internal/abi/symtab.go` — three flag bits are defined as of
+/// Source: `src/internal/abi/symtab.go` - three flag bits are defined as of
 /// Go 1.26:
 ///
 /// | Bit | Constant            | Meaning                                  |
@@ -981,7 +981,7 @@ pub struct FunctionTables<'a> {
 /// a [`FunctionInfo`] and its decoded per-PC tables.
 ///
 /// Bulk equivalent of [`FunctionIter`] paired with per-function table
-/// decoding — but using three reusable buffers shared across the whole walk
+/// decoding - but using three reusable buffers shared across the whole walk
 /// instead of allocating fresh `Vec`s for each function. For binaries with
 /// tens of thousands of functions this avoids `O(nfunc)` allocations.
 ///
@@ -1066,7 +1066,7 @@ where
 /// - `'a`: lifetime of the underlying binary bytes; yielded
 ///   [`FunctionInfo`] structs borrow strings from there.
 ///
-/// Skips functions whose `_func` struct fails to parse — adversarial pclntab
+/// Skips functions whose `_func` struct fails to parse - adversarial pclntab
 /// data cannot panic the iteration. Yields zero items for binaries without a
 /// recoverable pclntab.
 pub struct FunctionIter<'a> {
@@ -1364,7 +1364,7 @@ mod tests {
         assert!(make("main.main.func1").is_closure());
         assert!(make("main.main.func1.func2").is_closure());
         assert!(make("main.run.gowrap1").is_closure());
-        // Just `.func` without a digit — not a closure
+        // Just `.func` without a digit - not a closure
         assert!(!make("pkg.Func").is_closure());
         // A type literally named `Func` with a method
         assert!(!make("pkg.Func.Method").is_closure());

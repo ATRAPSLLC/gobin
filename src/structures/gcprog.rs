@@ -1,14 +1,14 @@
 //! GC pointer-map (GC program) decoder.
 //!
-//! `moduledata.gcdata` / `moduledata.gcbss` point at **GC programs** — a
+//! `moduledata.gcdata` / `moduledata.gcbss` point at **GC programs** - a
 //! Lempel-Ziv-style bytecode the runtime expands (`runGCProg`) into a 1-bit
 //! per pointer-sized word bitmap over the `[data, edata)` / `[bss, ebss)`
 //! segments. Bit `i` set means the word at `segment_start + i*ptrSize` holds a
 //! pointer.
 //!
 //! Decoding this gives a precise map of **where pointers live in global
-//! memory** — function pointers, interface/`itab` pointers, string/slice
-//! headers, global `*T` variables — without any disassembly.
+//! memory** - function pointers, interface/`itab` pointers, string/slice
+//! headers, global `*T` variables - without any disassembly.
 //!
 //! ## Bytecode
 //!
@@ -32,7 +32,7 @@ const HARD_WORD_CAP: usize = 64 * 1024 * 1024;
 /// `max_words` is the number of pointer-sized words the segment spans
 /// (`(edata - data) / ptrSize`). The returned vector has length `<= max_words`;
 /// element `i` is `true` when word `i` of the segment holds a pointer. Never
-/// panics on malformed input — it stops early and returns what it decoded.
+/// panics on malformed input - it stops early and returns what it decoded.
 pub fn run_gc_prog(prog: &[u8], max_words: usize) -> Vec<bool> {
     let cap = max_words.min(HARD_WORD_CAP);
     let mut out: Vec<bool> = Vec::new();

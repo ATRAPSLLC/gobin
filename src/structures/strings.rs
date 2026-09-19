@@ -1,6 +1,6 @@
 //! Go-style string literal scanner.
 //!
-//! Go strings are stored as `(ptr, len)` headers — *not* NUL-terminated —
+//! Go strings are stored as `(ptr, len)` headers - *not* NUL-terminated -
 //! with the actual UTF-8 bytes living in `.rodata` (or equivalent for
 //! non-ELF). A generic strings extractor either misses them entirely or
 //! splits them at internal NULs. This module provides a precise scanner:
@@ -11,7 +11,7 @@
 //!
 //! ## Heuristics
 //!
-//! False positives are inherent to a `(u64, u64)` scan — any random pair
+//! False positives are inherent to a `(u64, u64)` scan - any random pair
 //! that happens to look like `(in-segment ptr, plausible len)` and points
 //! to UTF-8 bytes will match. We minimize them by:
 //!
@@ -26,7 +26,7 @@
 //! Consumers decide whether to interpret bytes as text via [`GoString::as_bytes`],
 //! [`GoString::try_as_str`], or the convenience [`GoString::as_str`].
 //!
-//! Duplicate yields are *not* filtered — a string referenced from N
+//! Duplicate yields are *not* filtered - a string referenced from N
 //! different positions yields N times. Consumers that want unique results
 //! can `.collect::<HashSet<_>>()`.
 
@@ -61,7 +61,7 @@ pub struct GoString<'a> {
 impl<'a> GoString<'a> {
     /// Raw bytes of the string, borrowed from the binary.
     ///
-    /// Always succeeds — this is the canonical view for callers that want
+    /// Always succeeds - this is the canonical view for callers that want
     /// to handle arbitrary byte content (hex-dump, base64-encode, MinHash,
     /// etc.). Unlike [`Self::as_str`] / [`Self::try_as_str`], no UTF-8
     /// validation is performed.
@@ -121,7 +121,7 @@ impl<'a> Iterator for GoStringIter<'a> {
             return None;
         }
         let ps_u8 = u8::try_from(ps).ok()?;
-        // Walk the address space the runtime would see — for wasm the
+        // Walk the address space the runtime would see - for wasm the
         // reconstructed linear-memory image, otherwise the file bytes.
         let data = self.ctx.structure_search_data();
 
@@ -155,7 +155,7 @@ impl<'a> Iterator for GoStringIter<'a> {
                 Some(b) => b,
                 None => continue,
             };
-            // No UTF-8 filter here — see the module-level docs. Callers that
+            // No UTF-8 filter here - see the module-level docs. Callers that
             // need text use `GoString::try_as_str` / `as_str`; callers that
             // want raw rodata bytes (malware payloads, MinHash signal) use
             // `GoString::as_bytes`.
@@ -181,7 +181,7 @@ pub fn extract_iter<'a>(
     let (text_start, text_end) = match moduledata {
         Some(m) => (m.text, m.etext),
         // Without moduledata we can't filter text pointers; everything is a
-        // candidate. That's acceptable — the UTF-8 + length filters still
+        // candidate. That's acceptable - the UTF-8 + length filters still
         // cut most noise.
         None => (0, 0),
     };
