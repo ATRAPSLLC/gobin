@@ -44,7 +44,7 @@
 //! Wasm support reconstructs a single linear-memory image from the wasm
 //! Data section's individual segments so runtime structures (pclntab,
 //! moduledata, type descriptors) that span multiple disjoint segments can
-//! be addressed by their linear-memory VA — see
+//! be addressed by their linear-memory VA - see
 //! [`structures::wasm`] and the [`BinaryFormat::Wasm`]
 //! variant rustdoc for details.
 //!
@@ -120,7 +120,7 @@ pub struct GoBinary<'a> {
     build_info: Option<BuildInfo<'a>>,
     /// Cached pclntab scalars. The borrowing [`ParsedPclntab`] view is
     /// reconstructed on demand via [`Self::pclntab`] so it can borrow from
-    /// `&self.ctx` — important for wasm, where the address space pclntab
+    /// `&self.ctx` - important for wasm, where the address space pclntab
     /// lives in is the linear-memory image owned by the context (and is
     /// therefore not borrowable with the input lifetime `'a`).
     pclntab_meta: Option<PclntabMeta>,
@@ -146,7 +146,7 @@ impl<'a> GoBinary<'a> {
     /// # Working with mmap-ed input
     ///
     /// `parse` borrows the input for the lifetime of the returned [`GoBinary`].
-    /// Any byte slice works — including one backed by `memmap2::Mmap` —
+    /// Any byte slice works - including one backed by `memmap2::Mmap` -
     /// regardless of source. There is no separate mmap-specific entry point;
     /// just pass `&mmap[..]`.
     ///
@@ -161,8 +161,8 @@ impl<'a> GoBinary<'a> {
     /// containing the [`ConfidenceReport`] gathered during detection.
     ///
     /// Detection signals are also retained on success, accessible via
-    /// [`Self::report`] — useful for surfacing analyst-facing diagnostics
-    /// (e.g. "Go binary, but pclntab missing — likely heavily patched").
+    /// [`Self::report`] - useful for surfacing analyst-facing diagnostics
+    /// (e.g. "Go binary, but pclntab missing - likely heavily patched").
     pub fn try_parse(data: &'a [u8]) -> Result<Self, ParseError> {
         let ctx = BinaryContext::new(data);
         let mut report = ConfidenceReport::empty();
@@ -289,11 +289,11 @@ impl<'a> GoBinary<'a> {
         self.report.tier
     }
 
-    /// Structured detection report — the confidence tier plus every signal
+    /// Structured detection report - the confidence tier plus every signal
     /// observed during parse.
     ///
     /// Useful for analyst-facing diagnostics ("Go binary, but pclntab is
-    /// missing — likely heavily patched") and for surfacing details in bug
+    /// missing - likely heavily patched") and for surfacing details in bug
     /// reports.
     pub fn report(&self) -> &ConfidenceReport {
         &self.report
@@ -342,7 +342,7 @@ impl<'a> GoBinary<'a> {
     ///
     /// For bulk per-function processing where you also need decoded pcsp /
     /// pcln / pcfile tables, use [`crate::metadata::for_each_function`]
-    /// instead — it amortizes table-decode buffers across the whole walk.
+    /// instead - it amortizes table-decode buffers across the whole walk.
     pub fn functions(&self) -> FunctionIter<'_> {
         FunctionIter::new(self.pclntab())
     }
@@ -381,7 +381,7 @@ impl<'a> GoBinary<'a> {
     /// The runtime links one `moduledata` per loaded module (the main binary
     /// plus any plugins / shared libraries) via the `next` field. **That field
     /// is populated at load time**, so in a static on-disk binary it is almost
-    /// always nil and this returns a single entry — the chain is followed
+    /// always nil and this returns a single entry - the chain is followed
     /// defensively (with a cycle guard) for the rare multi-module image and so
     /// plugin/shared objects analyzed on their own parse correctly. Empty if
     /// the binary has no locatable moduledata.
@@ -419,7 +419,7 @@ impl<'a> GoBinary<'a> {
         Moduledata::parse(bytes, meta.ptr_size, hints)
     }
 
-    /// Virtual address of `runtime.text` — the first byte of Go-emitted code.
+    /// Virtual address of `runtime.text` - the first byte of Go-emitted code.
     ///
     /// `entry_off` on each [`FuncData`] is measured relative to this address.
     /// In most cases callers should reach for [`Self::entry_va`] /
@@ -433,7 +433,7 @@ impl<'a> GoBinary<'a> {
     /// tried in decreasing order of authority:
     ///
     /// 1. `moduledata.text`.
-    /// 2. The pclntab's own record of `runtime.text` — the pcHeader
+    /// 2. The pclntab's own record of `runtime.text` - the pcHeader
     ///    `textStart` field on Go 1.18-1.25, or the lowest absolute function
     ///    PC on Go 1.2-1.17 (both surface as `header_text_start` /
     ///    `text_start`).
@@ -443,7 +443,7 @@ impl<'a> GoBinary<'a> {
     ///    `runtime.text` at the start of `.text` / `__text` on every format,
     ///    so the section header supplies it.
     ///
-    /// Returns `None` rather than `0` when nothing is available — a bogus
+    /// Returns `None` rather than `0` when nothing is available - a bogus
     /// `Some(0)` would silently turn every [`Self::entry_va`] into a raw
     /// `entry_off`.
     pub fn text_va(&self) -> Option<u64> {
@@ -475,7 +475,7 @@ impl<'a> GoBinary<'a> {
     /// (binary lacks moduledata or VA mapping) or the addition overflows.
     ///
     /// For ELF and Mach-O this is the address a disassembler will use
-    /// directly. For PE this is still a true VA — pass it to
+    /// directly. For PE this is still a true VA - pass it to
     /// [`Self::entry_rva`] (or subtract [`BinaryContext::image_base`]) to get
     /// the RVA most PE-aware tools expect.
     pub fn entry_va(&self, func: &FuncData) -> Option<u64> {
@@ -494,7 +494,7 @@ impl<'a> GoBinary<'a> {
         self.entry_va(func)?.checked_sub(self.ctx.image_base())
     }
 
-    /// Virtual address of `runtime.etext` — one past the last byte of
+    /// Virtual address of `runtime.etext` - one past the last byte of
     /// Go-emitted code.
     ///
     /// `etext_va() - text_va()` gives the total size of all Go-emitted code,
@@ -503,7 +503,7 @@ impl<'a> GoBinary<'a> {
         self.moduledata.as_ref().map(|m| m.etext)
     }
 
-    /// Whether this module contains the program's `main` — true for the main
+    /// Whether this module contains the program's `main` - true for the main
     /// executable, false for a plugin / shared library.
     ///
     /// Read from `moduledata.hasmain`. `None` if moduledata is unavailable.
@@ -511,12 +511,12 @@ impl<'a> GoBinary<'a> {
         self.moduledata.as_ref().map(|m| m.has_main)
     }
 
-    /// Pointer map of the initialized data segment (`[data, edata)`) — which
+    /// Pointer map of the initialized data segment (`[data, edata)`) - which
     /// pointer-sized words hold pointers, decoded from the `gcdata` GC program.
     ///
     /// This is the precise location of every pointer in global initialized
     /// memory (function pointers, `itab`/interface pointers, string/slice
-    /// headers, global `*T` variables) — recoverable without disassembly.
+    /// headers, global `*T` variables) - recoverable without disassembly.
     /// `None` if moduledata / the GC data is unavailable.
     pub fn data_pointer_map(&self) -> Option<gcprog::PointerMap> {
         let md = self.moduledata.as_ref()?;
@@ -565,7 +565,7 @@ impl<'a> GoBinary<'a> {
     }
 
     /// Whether the binary was built with coverage instrumentation
-    /// (`-cover`) — detected via a non-empty `moduledata` coverage-counter
+    /// (`-cover`) - detected via a non-empty `moduledata` coverage-counter
     /// region. Always `false` for Go < 1.20 (the region did not exist).
     pub fn is_coverage_build(&self) -> bool {
         self.moduledata
@@ -711,7 +711,7 @@ impl<'a> GoBinary<'a> {
     /// Which Go compiler toolchain produced this binary.
     ///
     /// Detection order:
-    /// 1. `-compiler` build setting (`gc`, `gccgo`, etc.) — authoritative.
+    /// 1. `-compiler` build setting (`gc`, `gccgo`, etc.) - authoritative.
     /// 2. `tinygo` substring in the Go version string.
     /// 3. Presence of pclntab → `gc` (TinyGo and gccgo do not produce it).
     /// 4. Otherwise [`Compiler::Unknown`].
@@ -795,7 +795,7 @@ impl<'a> GoBinary<'a> {
     /// commit hash is not stamped into the version string.
     ///
     /// For CVE matching against the Go toolchain itself, the commit hash is
-    /// more precise than the marketing version — released versions only narrow
+    /// more precise than the marketing version - released versions only narrow
     /// to a tag.
     pub fn runtime_commit(&self) -> Option<&str> {
         let v = self.go_version?;
@@ -867,7 +867,7 @@ impl<'a> GoBinary<'a> {
     /// and backing bytes (borrowed from read-only data). Works on stripped
     /// binaries. Returns an empty `Vec` when the binary embeds nothing.
     ///
-    /// Only the multi-file `embed.FS` form is recovered — the single-file
+    /// Only the multi-file `embed.FS` form is recovered - the single-file
     /// `//go:embed` string/`[]byte` forms compile to plain variables with no
     /// recognizable anchor and are not surfaced. This is the path Visus uses
     /// to recurse embedded dropper payloads out of Go binaries.
@@ -887,7 +887,7 @@ impl<'a> GoBinary<'a> {
     /// binary predates Go 1.24, lacks moduledata, or carries no init tasks.
     ///
     /// Init order reveals which packages run setup code at startup and in what
-    /// sequence — a useful lens on staging / persistence behaviour.
+    /// sequence - a useful lens on staging / persistence behaviour.
     pub fn init_order(&self) -> Vec<InitTask<'_>> {
         let md = match self.moduledata.as_ref() {
             Some(m) => m,
@@ -903,7 +903,7 @@ impl<'a> GoBinary<'a> {
         //
         // A binary has thousands of functions and a couple of dozen init
         // tasks, so the pass collects only the entry offsets the tasks
-        // actually reference — indexing every function into a map costs more
+        // actually reference - indexing every function into a map costs more
         // memory than the whole rest of this call and throws almost all of it
         // away. It also walks `func_entries` rather than `functions()`, which
         // would additionally decode a source file, line range and frame size
@@ -971,14 +971,14 @@ impl<'a> GoBinary<'a> {
     /// `types+itaboffset` (Go 1.27+ / V5). Returns an empty iterator when no
     /// source is available (heavily stripped binaries).
     ///
-    /// Useful for "what implements `io.Reader` in this binary?" queries —
+    /// Useful for "what implements `io.Reader` in this binary?" queries -
     /// pair with [`Self::types`] to resolve each VA back to a named type.
     pub fn itab_pairs(&self) -> itab::ItabIter<'_> {
         let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
         itab::extract_iter(&self.ctx, ptr_size, self.moduledata.as_ref())
     }
 
-    /// The `Fun[]` method-pointer array of an itab — the concrete-type methods
+    /// The `Fun[]` method-pointer array of an itab - the concrete-type methods
     /// bound to each interface method, in interface order (a `0` entry means
     /// the method is unbound). Pair with [`Self::itab_pairs`].
     pub fn itab_methods(&self, pair: &itab::ItabPair) -> Vec<u64> {
@@ -989,13 +989,13 @@ impl<'a> GoBinary<'a> {
     /// Whether the binary's pclntab references any cgo-related runtime
     /// functions (`runtime.cgocall`, `runtime.cgocallback`, etc.).
     ///
-    /// This is a binary-level "did this binary use cgo at all?" signal — a
+    /// This is a binary-level "did this binary use cgo at all?" signal - a
     /// strong indicator the program may execute native code from C (DLLs,
     /// syscalls, exploits). Per-call-site enumeration would require
     /// disassembly support, which the crate does not have today.
     pub fn has_cgo(&self) -> bool {
         // Short-circuits on the first matching function via the streaming
-        // iterator — does not materialize the whole function list.
+        // iterator - does not materialize the whole function list.
         self.functions().any(|f| is_cgo_runtime_fn(f.name))
     }
 
@@ -1050,7 +1050,7 @@ impl<'a> GoBinary<'a> {
     /// (pointer/slice/array/chan elements, map key/value, struct field types,
     /// func parameter/result types, method signatures, and each type's
     /// pointer-to-this), parsing each descriptor independently by virtual
-    /// address. This reaches types absent from `typelink` — e.g. a struct type
+    /// address. This reaches types absent from `typelink` - e.g. a struct type
     /// used only as a pointer's element, together with its field tags. Capped
     /// to bound pathological graphs.
     pub fn all_types(&self) -> Vec<types::GoType<'_>> {
@@ -1100,12 +1100,12 @@ impl<'a> GoBinary<'a> {
     /// on Go binaries.
     ///
     /// Yields zero items when the binary lacks VA mapping. Length filter:
-    /// 2..=4096 bytes. UTF-8 is **not** required — malware frequently stashes
+    /// 2..=4096 bytes. UTF-8 is **not** required - malware frequently stashes
     /// non-UTF-8 payloads in length-prefixed rodata entries; use
     /// [`gostrings::GoString::as_bytes`] for raw bytes,
     /// [`gostrings::GoString::try_as_str`] / [`gostrings::GoString::as_str`]
     /// for text. Pointers into the text segment (`[moduledata.text,
-    /// moduledata.etext)`) are excluded. **Duplicates are not filtered** —
+    /// moduledata.etext)`) are excluded. **Duplicates are not filtered** -
     /// a string referenced from N positions yields N times. Collect into a
     /// `HashSet` if you want unique results.
     pub fn strings(&self) -> gostrings::GoStringIter<'_> {
@@ -1128,7 +1128,7 @@ impl<'a> GoBinary<'a> {
 /// invoke the full analyzer.
 ///
 /// False negatives are possible (heavily patched binaries where every marker
-/// has been wiped). False positives are unlikely — these magic byte sequences
+/// has been wiped). False positives are unlikely - these magic byte sequences
 /// don't naturally appear in non-Go binaries.
 pub fn detect(data: &[u8]) -> bool {
     if find_bytes(data, b"\xff Go buildinf:").is_some() {
@@ -1281,7 +1281,7 @@ fn parse_go_minor_version(version: &str) -> Option<u32> {
 /// Locate and parse the moduledata for accessor-only use (text/etext/types
 /// region addresses).
 ///
-/// Delegates to [`ModuledataLocator`], which owns every discovery strategy —
+/// Delegates to [`ModuledataLocator`], which owns every discovery strategy -
 /// the `.go.module` section on Go 1.26+ ELF / Mach-O, and the `pcHeader`-
 /// pointer scan everywhere else. Returns `None` if the binary lacks VA
 /// mappings or the moduledata cannot be located; callers degrade gracefully

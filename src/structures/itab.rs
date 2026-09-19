@@ -1,4 +1,4 @@
-//! `itablink` decoder — recovers `(interface, concrete type)` pairs.
+//! `itablink` decoder - recovers `(interface, concrete type)` pairs.
 //!
 //! When the Go linker proves that a concrete type implements an interface, it
 //! emits an `itab` record carrying both type-descriptor pointers plus a hash
@@ -22,7 +22,7 @@
 //! ## Why It Matters
 //!
 //! Itab pairs let an analyst answer questions like "what implements
-//! `io.Reader` in this binary?" — extremely useful when chasing exfiltration
+//! `io.Reader` in this binary?" - extremely useful when chasing exfiltration
 //! paths in malware analysis.
 
 use crate::{
@@ -51,7 +51,7 @@ pub struct ItabPair {
 /// Each [`Iterator::next`] reads one pointer from the underlying itab-array
 /// (either the `.itablink` section or `moduledata.itablinks`), dereferences
 /// it through VA→file translation, and parses the [`ItabPair`]. Skips entries
-/// that fail to dereference / parse — adversarial input cannot panic the walk.
+/// that fail to dereference / parse - adversarial input cannot panic the walk.
 pub struct ItabIter<'a> {
     ctx: &'a BinaryContext<'a>,
     ps: usize,
@@ -129,7 +129,7 @@ impl Iterator for ItabIter<'_> {
                 // Advance by the record's true size. `itab.Size()` is
                 // sizeof(itab) (== 4*ptrSize) when `fun[0] == 0`, else
                 // 4*ptrSize + (nmethods-1)*ptrSize. Stop the walk if we
-                // cannot compute a strictly-positive stride — better to
+                // cannot compute a strictly-positive stride - better to
                 // truncate than to misalign and emit garbage.
                 let stride = itab_stride(self.ctx, cur, ps, ps_u8)?;
                 let next = cur.checked_add(stride as u64)?;
@@ -227,7 +227,7 @@ fn itab_stride(ctx: &BinaryContext<'_>, itab_va: u64, ps: usize, ps_u8: u8) -> O
     base.checked_add(extra)
 }
 
-/// Resolve the `Fun[]` method-pointer array of an itab — the concrete-type
+/// Resolve the `Fun[]` method-pointer array of an itab - the concrete-type
 /// implementations bound to each interface method, in interface-method order.
 ///
 /// `Fun` sits at `itab_va + 3*ptrSize` and has one `uintptr` per interface

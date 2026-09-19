@@ -6,7 +6,7 @@
 //! binary:
 //!
 //! - [`walk`] enumerates top-level sections, surfacing custom-section names
-//!   (`go:buildid`, `producers`, `name` — per `src/cmd/link/internal/wasm/asm.go`)
+//!   (`go:buildid`, `producers`, `name` - per `src/cmd/link/internal/wasm/asm.go`)
 //!   and Data-section payload bounds. The Go linker does *not* emit a
 //!   dedicated `.gopclntab` custom section for wasm; pclntab + buildinfo
 //!   live inside the Data-section linear-memory payload, alongside the rest
@@ -23,7 +23,7 @@
 //!   parsers address them by their runtime VA the same way they do on
 //!   ELF/Mach-O/PE.
 //!
-//! This module is intentionally narrow — it does not understand wasm
+//! This module is intentionally narrow - it does not understand wasm
 //! function types, imports, exports, instructions, or linking metadata.
 //! Anything more is the caller's job.
 //!
@@ -39,7 +39,7 @@ pub struct WasmSection<'a> {
     /// Custom-section name when `id == 0`, else `None`.
     pub name: Option<&'a str>,
     /// File-offset range covering just the section's payload (excludes the
-    /// id byte, the LEB128 length prefix, and — for custom sections — the
+    /// id byte, the LEB128 length prefix, and - for custom sections - the
     /// name header).
     pub payload_offset: usize,
     /// Length of the payload range.
@@ -79,7 +79,7 @@ impl<'a> Iterator for WasmSectionIter<'a> {
         let size = usize::try_from(size).ok()?;
         let payload_end = after_len.checked_add(size)?;
         if payload_end > self.data.len() {
-            // Malformed section — abort the walk.
+            // Malformed section - abort the walk.
             self.pos = self.data.len();
             return None;
         }
@@ -186,7 +186,7 @@ pub fn data_segments(data: &[u8]) -> Vec<WasmDataSegment> {
                         u64::from(val as u32)
                     }
                     _ => {
-                        // Unsupported offset expression — bail rather than
+                        // Unsupported offset expression - bail rather than
                         // silently miscompute.
                         return out;
                     }
@@ -230,7 +230,7 @@ pub fn data_segments(data: &[u8]) -> Vec<WasmDataSegment> {
 /// Build a linear-memory image from wasm data segments, copying each
 /// segment's bytes to its target offset and zero-filling gaps.
 ///
-/// Returns `None` if the resulting image would exceed `max_size_bytes` —
+/// Returns `None` if the resulting image would exceed `max_size_bytes` -
 /// adversarial input could request gigabytes of zero-fill, so callers gate
 /// this behind a sanity cap. The returned vector's length is exactly the
 /// largest `mem_offset + size` across all segments.
@@ -264,7 +264,7 @@ pub fn build_linear_memory_image(data: &[u8], max_size_bytes: usize) -> Option<V
 /// Read an unsigned LEB128 at `offset`. Returns `(value, position_after)`.
 ///
 /// Bounded to 5 bytes so adversarial input cannot make the loop run
-/// indefinitely — five 7-bit chunks cover any `u32`, which is enough for
+/// indefinitely - five 7-bit chunks cover any `u32`, which is enough for
 /// every wasm-format unsigned LEB128.
 fn read_uleb128(data: &[u8], offset: usize) -> Option<(u32, usize)> {
     let mut result: u32 = 0;

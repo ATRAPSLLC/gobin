@@ -50,7 +50,7 @@ pub(crate) fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
 
 /// Advance a cursor `off` by `by` bytes, returning `None` on overflow.
 ///
-/// Idiomatic shorthand for `off.checked_add(by)` — used by sequential parsers
+/// Idiomatic shorthand for `off.checked_add(by)` - used by sequential parsers
 /// like [`crate::structures::moduledata::Moduledata::parse`] that walk
 /// fixed-layout records field by field.
 #[inline]

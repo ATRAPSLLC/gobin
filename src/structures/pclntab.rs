@@ -136,13 +136,13 @@ const MAGICS: &[([u8; 4], PclntabVersion)] = &[
 /// = the `pcHeader` magic bytes). The lifetime `'a` borrows from the address
 /// space the parser ran on:
 ///
-/// - For ELF / Mach-O / PE this is the input file bytes — zero-copy access.
+/// - For ELF / Mach-O / PE this is the input file bytes - zero-copy access.
 /// - For Wasm this is the reconstructed linear-memory image owned by
 ///   [`crate::formats::BinaryContext`]; in that case the borrow lives only as
 ///   long as the `&BinaryContext` it was derived from. Cache the scalar
 ///   metadata via [`Self::meta`] if you need to re-attach later.
 ///
-/// Cheap to copy — every field is `Copy` (`&'a [u8]` and integers).
+/// Cheap to copy - every field is `Copy` (`&'a [u8]` and integers).
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedPclntab<'a> {
     /// The entire pclntab section data, starting at the pcHeader.
@@ -186,7 +186,7 @@ pub struct ParsedPclntab<'a> {
     /// longer stored… Code should use the moduledata text field instead."*).
     ///
     /// `None` for Go 1.16-1.17, which lack the field, and for Go 1.26+, where
-    /// the slot reads as zero — a zero is reported as absent rather than as
+    /// the slot reads as zero - a zero is reported as absent rather than as
     /// address `0`, so callers do not silently rebase every function entry
     /// against the bottom of the address space. Mirrors `moduledata.text`.
     pub header_text_start: Option<u64>,
@@ -235,13 +235,13 @@ impl PclntabMeta {
     ///
     /// `address_data` is the full address-space view the metadata was
     /// originally derived from (for ELF/Mach-O/PE, the input file bytes; for
-    /// wasm, the reconstructed linear-memory image — typically obtained via
+    /// wasm, the reconstructed linear-memory image - typically obtained via
     /// [`crate::formats::BinaryContext::structure_search_data`]). This
     /// helper slices it at [`Self::offset`] so the returned struct's
     /// `data[0]` is the pcHeader's first byte, matching the layout
     /// `pclntab::parse` produces.
     ///
-    /// Returns `None` if `address_data` does not cover `self.offset` —
+    /// Returns `None` if `address_data` does not cover `self.offset` -
     /// would only happen if the buffer the metadata came from is not the one
     /// passed in.
     pub fn attach<'a>(&self, address_data: &'a [u8]) -> Option<ParsedPclntab<'a>> {
@@ -291,7 +291,7 @@ impl<'a> ParsedPclntab<'a> {
     /// See [`Arch`] for the mapping table and caveats. Several
     /// `(minLC, ptrSize)` combinations are ambiguous; in particular
     /// `(1, 8)` matches both `Arch::X86_64` and `Arch::Wasm`. This accessor
-    /// always reports `Arch::X86_64` for that combination — use
+    /// always reports `Arch::X86_64` for that combination - use
     /// [`crate::GoBinary::arch`] for the format-disambiguated result.
     pub fn arch(&self) -> Arch {
         match (self.min_lc, self.ptr_size) {
@@ -346,7 +346,7 @@ impl<'a> ParsedPclntab<'a> {
     /// measured from.
     ///
     /// In Go 1.16+, `funcoff` is relative to the functab section start
-    /// ([`Self::functab_offset`]) — the `_func` structs sit there, after the
+    /// ([`Self::functab_offset`]) - the `_func` structs sit there, after the
     /// `(nfunc+1)` entry pairs. In Go 1.2-1.15 there is no separate functab
     /// section: `funcoff` is an offset from the pcHeader itself (`data[0]`), so
     /// the base is `0`.
@@ -438,7 +438,7 @@ impl<'a> ParsedPclntab<'a> {
 
     /// Read the i-th `funcdata[]` offset for the given function. The value
     /// is a `u32` offset into `moduledata.gofunc`; `0xFFFFFFFF` (`^uint32(0)`)
-    /// is the sentinel for "no funcdata at this index" — callers should treat
+    /// is the sentinel for "no funcdata at this index" - callers should treat
     /// it as `None`.
     ///
     /// Returns `None` if `i >= func.nfuncdata` or the read goes out of bounds.
@@ -522,7 +522,7 @@ impl<'a> ParsedPclntab<'a> {
     ///
     /// pcfile entries whose index doesn't resolve through the cutab are
     /// skipped (consistent with [`Self::decode_pcfile_paths`]). pcln events
-    /// before the first pcfile transition are also skipped — they would
+    /// before the first pcfile transition are also skipped - they would
     /// have no file to attribute to.
     pub fn decode_pcln_with_files<'pcl>(&'pcl self, func: &FuncData) -> PcLineFileIter<'pcl, 'a> {
         PcLineFileIter {
@@ -927,7 +927,7 @@ impl<'a> Iterator for PcFilePathIter<'_, 'a> {
 /// Yields `(pc_offset, line, file_path)`. The file table only emits a
 /// transition when the active source file *changes*, so the joined iterator
 /// carries the latest transition forward across `pcln` events. Entries whose
-/// file index doesn't resolve through the cutab are skipped silently — same
+/// file index doesn't resolve through the cutab are skipped silently - same
 /// rule as [`PcFilePathIter`].
 ///
 /// This replaces the hand-rolled "walk pcfile and pcln in lockstep" state
@@ -952,7 +952,7 @@ impl<'a> Iterator for PcLineFileIter<'_, 'a> {
 
             // Advance the pcfile cursor to the latest transition with pc ≤ current.
             // pcfile transitions are emitted in monotonically increasing PC order,
-            // and we walk pcln in the same order — so the cursor only ever moves
+            // and we walk pcln in the same order - so the cursor only ever moves
             // forward.
             let mut next_idx = match self.cursor {
                 Some(c) => c.saturating_add(1),
@@ -971,7 +971,7 @@ impl<'a> Iterator for PcLineFileIter<'_, 'a> {
 
             let cursor = match self.cursor {
                 Some(c) => c,
-                // No pcfile transition yet ≤ current pc — try the next pcln event.
+                // No pcfile transition yet ≤ current pc - try the next pcln event.
                 None => continue,
             };
             let (_, file_idx) = match self.pcfile.get(cursor) {
@@ -1067,19 +1067,19 @@ impl FuncData {
 ///
 /// Uses a layered detection strategy, from cheapest/most reliable to most expensive:
 ///
-/// 1. **Known section + magic** — If the binary has a `.gopclntab` section, validate
+/// 1. **Known section + magic** - If the binary has a `.gopclntab` section, validate
 ///    its start against the known magic bytes. This is the fastest and most reliable path.
-/// 2. **Full magic scan** — Scan the entire binary at 4-byte aligned offsets for one
+/// 2. **Full magic scan** - Scan the entire binary at 4-byte aligned offsets for one
 ///    of the four known magic values, then validate the full header.
-/// 3. **Relaxed header scan** — If magic bytes were wiped (common in malware), scan
+/// 3. **Relaxed header scan** - If magic bytes were wiped (common in malware), scan
 ///    for the pcHeader structural pattern without requiring magic. Validates
 ///    `pad1==0, pad2==0, minLC∈{1,2,4}, ptrSize∈{4,8}` plus sub-table offset
 ///    monotonicity and funcname spot-checking. (Strategy A from RESEARCH.md §1.5)
-/// 4. **moduledata pointer chain** — Scan data sections for pointer-aligned values
+/// 4. **moduledata pointer chain** - Scan data sections for pointer-aligned values
 ///    that point into the `.gopclntab` section range, then validate the target with
 ///    relaxed header validation. This mirrors how the Go runtime itself finds the
 ///    pclntab via `runtime.firstmoduledata.pcHeader`. (Strategy B from RESEARCH.md §1.5)
-/// 5. **functab monotonicity** — Scan read-only sections for long arrays of
+/// 5. **functab monotonicity** - Scan read-only sections for long arrays of
 ///    `(u32, u32)` pairs with strictly monotonically increasing first elements.
 ///    Work backwards to find the pcHeader. (Strategy C from RESEARCH.md §1.5)
 pub fn parse<'a>(ctx: &'a BinaryContext<'a>) -> Option<ParsedPclntab<'a>> {
@@ -1169,7 +1169,7 @@ fn scan_for_magic_strided(data: &[u8], stride: usize) -> Option<ParsedPclntab<'_
 /// binary: pad bytes, minLC/ptrSize ranges, sub-table offset monotonicity,
 /// and a funcname spot-check for plausible ASCII strings.
 ///
-/// Source: `src/runtime/symtab.go:623-631` — the runtime's own validation.
+/// Source: `src/runtime/symtab.go:623-631` - the runtime's own validation.
 fn try_parse_relaxed(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_>> {
     if data.len() < 8 {
         return None;
@@ -1298,7 +1298,7 @@ fn scan_via_moduledata<'a>(ctx: &BinaryContext<'a>) -> Option<ParsedPclntab<'a>>
             };
 
             // Must point to the start of the gopclntab section (pcHeader is at the beginning)
-            // Allow a small tolerance — the pointer should be within the first 64 bytes
+            // Allow a small tolerance - the pointer should be within the first 64 bytes
             if candidate_va >= pclntab_va
                 && candidate_va < header_window_end
                 && candidate_va < pclntab_va_end
@@ -1520,14 +1520,14 @@ fn recover_header_from_functab<'a>(
 
 /// Parse a pcHeader at the start of `data` with a known version.
 ///
-/// Validates field ranges (nfunc, nfiles, offsets) but does NOT check magic bytes
-/// — the caller is responsible for version determination.
+/// Validates field ranges (nfunc, nfiles, offsets) but does NOT check magic bytes -
+/// the caller is responsible for version determination.
 fn parse_header(
     data: &[u8],
     base_offset: usize,
     version: PclntabVersion,
 ) -> Option<ParsedPclntab<'_>> {
-    // The Go 1.2-1.15 pclntab has no structured pcHeader — a different parser.
+    // The Go 1.2-1.15 pclntab has no structured pcHeader - a different parser.
     if version == PclntabVersion::Go12 {
         return parse_header_go12(data, base_offset);
     }
@@ -1592,8 +1592,8 @@ fn parse_header(
     // The pcHeader gained a `textStart` field at index 2 in Go 1.18; Go
     // 1.16-1.17 (off_base == 2) do not have it, and Go 1.26+ zeroed it out
     // (see `ParsedPclntab::header_text_start`). `runtime.text` is never 0 in a
-    // real image — even wasm, whose PCs start at 0, carries the value in the
-    // moduledata rather than here — so a zero means "not recorded".
+    // real image - even wasm, whose PCs start at 0, carries the value in the
+    // moduledata rather than here - so a zero means "not recorded".
     let header_text_start = if off_base > 2 {
         let off = advance_n(8, 2, ps)?;
         read_uintptr(data, off, ptr_size).filter(|&va| va != 0)
@@ -1624,7 +1624,7 @@ fn parse_header(
 /// Unlike Go 1.16+, the legacy format has no structured `pcHeader`: the 8-byte
 /// prefix (`magic`, two pad bytes, `minLC`, `ptrSize`) is followed immediately
 /// by a pointer-sized `nfunctab` and the functab itself. There is no separate
-/// `funcnametab`, `cutab`, or `pctab` — function names and the `pcsp`/`pcfile`/
+/// `funcnametab`, `cutab`, or `pctab` - function names and the `pcsp`/`pcfile`/
 /// `pcln` tables are addressed by offsets relative to the pcHeader (`data[0]`),
 /// so [`ParsedPclntab::funcname_offset`] and [`ParsedPclntab::pctab_offset`]
 /// are both `0`. The filetab is located by a `u32` stored immediately after the
@@ -1726,7 +1726,7 @@ fn parse_header_go12(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
 /// - **Go 1.20+**: adds `startLine`. Size `44`.
 #[derive(Clone, Copy)]
 struct FuncLayout {
-    /// Total struct size — the stride before the `pcdata`/`funcdata` arrays.
+    /// Total struct size - the stride before the `pcdata`/`funcdata` arrays.
     size: usize,
     /// Whether the leading `entry` field is a pointer-sized absolute PC
     /// (Go 1.2-1.17) rather than a `u32` offset.
@@ -1738,7 +1738,7 @@ struct FuncLayout {
     pcfile: usize,
     pcln: usize,
     npcdata: usize,
-    /// `cuOffset` offset (Go 1.16+), else `None` — Go 1.2-1.15 has no cutab and
+    /// `cuOffset` offset (Go 1.16+), else `None` - Go 1.2-1.15 has no cutab and
     /// resolves files directly through the `[]uint32` filetab (read as 0).
     cu_offset: Option<usize>,
     /// `startLine` offset (Go 1.20+), else `None` (read as 0).
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[test]
     fn test_strategy_a_relaxed_header_zeroed_magic() {
-        // Build a valid pclntab, then zero the magic — relaxed scan should still find it
+        // Build a valid pclntab, then zero the magic - relaxed scan should still find it
         let mut data = build_synthetic_pclntab([0xf1, 0xff, 0xff, 0xff]);
         data[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]); // wipe magic
 

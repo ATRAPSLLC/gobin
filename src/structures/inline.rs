@@ -21,9 +21,9 @@
 //!
 //! ## Decoding chain
 //!
-//! 1. Read `funcdata[FUNCDATA_InlTree]` (constant `3`) for the function — a
+//! 1. Read `funcdata[FUNCDATA_InlTree]` (constant `3`) for the function - a
 //!    `u32` offset added to `moduledata.gofunc` to get the inline-tree blob's VA.
-//! 2. Decode `pcdata[PCDATA_InlTreeIndex]` (constant `2`) — yields
+//! 2. Decode `pcdata[PCDATA_InlTreeIndex]` (constant `2`) - yields
 //!    `(pc_offset, index)` pairs. `index < 0` means "not inlined here";
 //!    `index >= 0` selects an entry in the inline-tree blob.
 //! 3. For each non-negative range, read the 16-byte entry at
@@ -78,7 +78,7 @@ pub struct InlineEntry<'a> {
     ///
     /// # Bounds
     ///
-    /// Real-world Go inline chains are very shallow — typically `< 5` — and
+    /// Real-world Go inline chains are very shallow - typically `< 5` - and
     /// the gobin walker caps depth at `32` to keep its cycle-detection
     /// scratch buffer fixed-size. In practice this field will always fit in
     /// a `u8`; consumers that store it in a narrower integer (e.g. visus
@@ -102,14 +102,14 @@ pub struct InlineTreeIter<'a> {
     pcdata: Vec<(u32, i32)>,
     /// Position into `pcdata`.
     pos: usize,
-    /// `prev_pc` for the current iteration — start of the next range.
+    /// `prev_pc` for the current iteration - start of the next range.
     prev_pc: u32,
     /// Inline-tree blob bytes (sequence of 16-byte `inlinedCall` records).
     blob: &'a [u8],
 }
 
 impl<'a> InlineTreeIter<'a> {
-    /// Construct an iterator that yields nothing — used when prerequisites
+    /// Construct an iterator that yields nothing - used when prerequisites
     /// (pclntab, moduledata, funcdata blob) are missing.
     pub fn empty() -> Self {
         Self {
@@ -175,7 +175,7 @@ impl<'a> InlineTreeIter<'a> {
                     visited_len = visited_len.saturating_add(1);
                 }
             } else {
-                // Chain longer than 32 — declare done. Beyond this point we
+                // Chain longer than 32 - declare done. Beyond this point we
                 // would also exceed any reasonable inlining depth.
                 return depth;
             }

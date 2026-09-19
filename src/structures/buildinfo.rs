@@ -142,9 +142,9 @@ pub fn extract<'a>(ctx: &BinaryContext<'a>) -> Option<BuildInfo<'a>> {
 /// narrows to the regions that can hold it before falling back to the whole
 /// image:
 ///
-/// 1. the dedicated `.go.buildinfo` / `__go_buildinfo` section — exact, and
+/// 1. the dedicated `.go.buildinfo` / `__go_buildinfo` section - exact, and
 ///    the usual case for ELF and Mach-O;
-/// 2. the `.data` / `.noptrdata` sections — PE merges every Go data symbol
+/// 2. the `.data` / `.noptrdata` sections - PE merges every Go data symbol
 ///    into `.data`, which is a small fraction of a Go binary (tens of KB
 ///    against megabytes of `.text` and `.rdata`);
 /// 3. the data regions of the image
@@ -168,8 +168,8 @@ fn find_magic(ctx: &BinaryContext<'_>, data: &[u8]) -> Option<usize> {
     // Fall back to a sweep, but only over the regions that can hold data: the
     // blob is a `sym.SBUILDINFO` symbol, so the executable section and the
     // pclntab are excluded. That matters most for wasm, which names no
-    // sections at all and would otherwise sweep the whole module — twice, once
-    // per candidate list above — to prove a blob it never carries is absent.
+    // sections at all and would otherwise sweep the whole module - twice, once
+    // per candidate list above - to prove a blob it never carries is absent.
     for (from, to) in ctx.data_regions() {
         if let Some(region) = data.get(from..to)
             && let Some(pos) = find_aligned_magic(region)
@@ -185,7 +185,7 @@ fn find_magic(ctx: &BinaryContext<'_>, data: &[u8]) -> Option<usize> {
 /// The Go linker aligns the symbol to [`BUILDINFO_ALIGN`] (a macOS
 /// requirement), so an aligned occurrence is the real one; an unaligned hit is
 /// still returned as a fallback in case a section offset shifted the
-/// alignment. Both are answered in a **single** sweep — the previous
+/// alignment. Both are answered in a **single** sweep - the previous
 /// aligned-then-unaligned pair walked the buffer twice, which on PE and wasm
 /// (neither of which has a `.go.buildinfo` section to narrow the search) meant
 /// scanning the whole image twice over.

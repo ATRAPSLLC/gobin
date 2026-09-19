@@ -7,13 +7,13 @@
 //! |-------------------------------|----------------------------------------------|
 //! | ELF / Mach-O, Go 1.26+        | the dedicated `.go.module` / `__go_module` section |
 //! | ELF / Mach-O, Go ≤ 1.25       | scan for the `pcHeader` pointer               |
-//! | PE (every version)            | scan — the Go PE linker emits no named Go sections |
+//! | PE (every version)            | scan - the Go PE linker emits no named Go sections |
 //! | wasm                          | scan the reconstructed linear-memory image    |
 //!
 //! The scan works because `moduledata`'s first field is `pcHeader *pcHeader`,
 //! which points at the pclntab: a pointer-aligned word equal to the pclntab's
 //! address, whose surroundings then parse as a plausible moduledata, is the
-//! moduledata. Candidates are validated rather than trusted — a pointer to the
+//! moduledata. Candidates are validated rather than trusted - a pointer to the
 //! pclntab can legitimately appear elsewhere in the image.
 //!
 //! [`ModuledataLocator`] owns all of that so the type reader and the top-level
@@ -71,7 +71,7 @@ impl<'a> ModuledataLocator<'a> {
     }
 
     /// Parse the moduledata out of the dedicated `.go.module` / `__go_module`
-    /// section (Go 1.26+ ELF and Mach-O). No search needed — the section *is*
+    /// section (Go 1.26+ ELF and Mach-O). No search needed - the section *is*
     /// the structure.
     fn in_section(&self) -> Option<Moduledata> {
         let range = self.ctx.sections().go_module.as_ref()?;
@@ -96,7 +96,7 @@ impl<'a> ModuledataLocator<'a> {
         // The section ranges are file offsets. They index the same bytes the
         // scan walks for ELF, Mach-O and PE, but for wasm the searched view is
         // the reconstructed linear-memory image, where a file offset means
-        // nothing — so wasm scans the image whole. It is the smaller of the
+        // nothing - so wasm scans the image whole. It is the smaller of the
         // two anyway, being only the module's initialized data.
         if self.ctx.format() != BinaryFormat::Wasm {
             let sections = self.ctx.sections();
@@ -176,7 +176,7 @@ impl<'a> ModuledataLocator<'a> {
     /// only accepted when the fields around it also hold: the PC range must be
     /// non-empty, and the structure must be anchored by a field that maps back
     /// into the image. The legacy (Go 1.5-1.15) layout has no `funcnametab`
-    /// and — before Go 1.7 — no `types` base, so it is anchored through its
+    /// and - before Go 1.7 - no `types` base, so it is anchored through its
     /// always-present `text` boundary instead.
     fn accept(&self, md: &Moduledata) -> bool {
         if md.minpc >= md.maxpc {

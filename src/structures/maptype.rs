@@ -7,8 +7,8 @@
 //! layouts in all), and
 //! the meaning of its flag bits changed once more on top of that. Reading one
 //! layout with another's field list silently shifts every field past the
-//! pointer block and — because the extra's size feeds
-//! [`crate::structures::descriptor::descriptor_size`] — mislocates the trailing
+//! pointer block and - because the extra's size feeds
+//! [`crate::structures::descriptor::descriptor_size`] - mislocates the trailing
 //! `UncommonType`, which then yields a garbage method count.
 //!
 //! ## Layouts
@@ -35,19 +35,19 @@
 //!
 //! ## Flag bits
 //!
-//! The `flags` word is **not** comparable across the hmap/Swiss boundary — Go
+//! The `flags` word is **not** comparable across the hmap/Swiss boundary - Go
 //! renumbered the bits when it introduced Swiss maps:
 //!
 //! | Property        | hmap (1.12-1.23) | Swiss (1.24+) |
 //! |-----------------|------------------|---------------|
 //! | indirect key    | `1 << 0`         | `1 << 2`      |
 //! | indirect elem   | `1 << 1`         | `1 << 3`      |
-//! | reflexive key   | `1 << 2`         | — (dropped)   |
+//! | reflexive key   | `1 << 2`         | - (dropped)   |
 //! | need key update | `1 << 3`         | `1 << 0`      |
 //! | hash might panic| `1 << 4`         | `1 << 1`      |
 //!
 //! Read them through [`MapTypeExtra::flags`], a [`MapFlags`] that normalizes
-//! all three encodings — including the pre-1.12 booleans — into `Option<bool>`
+//! all three encodings - including the pre-1.12 booleans - into `Option<bool>`
 //! per property. [`MapTypeExtra::raw_flags`] keeps the undecoded word for
 //! callers that want it.
 //!
@@ -63,7 +63,7 @@ use crate::structures::util::{read_u16, read_u32, read_uintptr};
 /// Which `abi` map-descriptor layout a binary uses.
 ///
 /// Determined from the Go version where one is available, and otherwise from
-/// the structural evidence the rest of the binary carries — see
+/// the structural evidence the rest of the binary carries - see
 /// [`MapLayout::infer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapLayout {
@@ -79,7 +79,7 @@ pub enum MapLayout {
     Swiss,
     /// Go 1.27+: Swiss tables carrying explicit key/elem offsets and strides.
     SwissSplitGroup,
-    /// Go 1.20-1.25 with no recoverable version string — the moduledata layout
+    /// Go 1.20-1.25 with no recoverable version string - the moduledata layout
     /// narrows the window but cannot separate `HmapHasher` (1.20-1.23) from
     /// `Swiss` (1.24-1.25). Each descriptor is then classified from its own
     /// bytes by [`MapLayout::resolve_for`].
@@ -102,8 +102,8 @@ impl MapLayout {
     /// Pick the layout from whatever evidence the binary offers.
     ///
     /// The Go version string settles it outright. Without one, the moduledata
-    /// layout still dates the binary exactly at two boundaries — `V5` is Go
-    /// 1.27+ and `V4` is Go 1.26 — and the pclntab magic gives a floor: Swiss
+    /// layout still dates the binary exactly at two boundaries - `V5` is Go
+    /// 1.27+ and `V4` is Go 1.26 - and the pclntab magic gives a floor: Swiss
     /// maps arrived in Go 1.24 and therefore imply the Go 1.20 magic, while
     /// anything below that magic is at most Go 1.19 and so `HmapHasher`
     /// (the layout in force from 1.14; older magics narrow it no further, and
@@ -136,8 +136,8 @@ impl MapLayout {
     /// Resolve [`Self::Probe`] against one descriptor's extra bytes; every
     /// other variant returns itself.
     ///
-    /// The two candidates in the ambiguous window — `HmapHasher` (Go
-    /// 1.20-1.23) and `Swiss` (Go 1.24-1.25) — both start with four
+    /// The two candidates in the ambiguous window - `HmapHasher` (Go
+    /// 1.20-1.23) and `Swiss` (Go 1.24-1.25) - both start with four
     /// pointer-sized fields, so they diverge at `extra + 4*ptrSize`, and the
     /// two readings of that word are disjoint in range:
     ///
@@ -146,8 +146,8 @@ impl MapLayout {
     ///   128 bytes indirectly (as pointers). So `GroupSize <= 2056` and every
     ///   bit above 15 is zero.
     /// - **HmapHasher** packs `KeySize u8`, `ValueSize u8`, `BucketSize u16`,
-    ///   `Flags u32` into the same word, and `BucketSize` — which lands in bits
-    ///   16..31 — is `8 + 8*(KeySize+ValueSize) + ptrSize`, never zero.
+    ///   `Flags u32` into the same word, and `BucketSize` - which lands in bits
+    ///   16..31 - is `8 + 8*(KeySize+ValueSize) + ptrSize`, never zero.
     ///
     /// A non-zero value above bit 15 therefore means `HmapHasher`; anything
     /// else is `Swiss`. On 32-bit the same reasoning applies to the `u32` at
@@ -232,14 +232,14 @@ pub struct MapTypeExtra {
     /// descriptor.
     pub group: u64,
     /// Virtual address of the `hmap` type descriptor
-    /// ([`MapLayout::HmapWithHmapType`] only — Go 1.11 removed the field).
+    /// ([`MapLayout::HmapWithHmapType`] only - Go 1.11 removed the field).
     pub hmap: Option<u64>,
     /// Virtual address of the key-hashing function. `None` for Go 1.11-1.13,
     /// which had no `hasher` field.
     pub hasher: Option<u64>,
     /// Size of a slot group in bytes (`GroupSize`). Swiss layouts only.
     pub group_size: Option<u64>,
-    /// Size of one key/elem slot (`SlotSize`). [`MapLayout::Swiss`] only —
+    /// Size of one key/elem slot (`SlotSize`). [`MapLayout::Swiss`] only -
     /// Go 1.27 replaced it with the explicit stride fields below.
     pub slot_size: Option<u64>,
     /// Offset of the keys array within a group (`KeysOff`).
@@ -266,7 +266,7 @@ pub struct MapTypeExtra {
     pub bucket_size: Option<u16>,
     /// Raw `flags` word. `None` for the pre-1.12 layouts, which encoded the
     /// same properties as separate booleans. **Bit meanings differ between the
-    /// hmap and Swiss eras** — prefer [`Self::flags`], which normalizes them.
+    /// hmap and Swiss eras** - prefer [`Self::flags`], which normalizes them.
     pub raw_flags: Option<u32>,
     /// Semantic flags, normalized across all three encodings.
     pub flags: MapFlags,
@@ -275,7 +275,7 @@ pub struct MapTypeExtra {
 impl MapTypeExtra {
     /// Binary size of the extra for the given pointer size and layout.
     ///
-    /// Every layout is `pointer_fields * ptrSize` followed by an 8-byte tail —
+    /// Every layout is `pointer_fields * ptrSize` followed by an 8-byte tail -
     /// either four small integers plus four booleans, or `u8 + u8 + u16 + u32`,
     /// or (Swiss) a `u32` padded out to pointer alignment. That comes to
     /// `pointers * ps + 8` on 64-bit and `pointers * ps + 8` on 32-bit for the

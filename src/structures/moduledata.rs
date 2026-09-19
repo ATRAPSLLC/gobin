@@ -21,8 +21,8 @@
 //!
 //! V5 moved `types`' neighbours, so a wrong guess shifts every field from
 //! `etypes` onward while still passing a head-only validity check. The
-//! out-of-band signals in [`LayoutHints`] are not sufficient on their own — PE
-//! carries no `.typelink` section at *any* Go version — so [`Moduledata::parse`]
+//! out-of-band signals in [`LayoutHints`] are not sufficient on their own - PE
+//! carries no `.typelink` section at *any* Go version - so [`Moduledata::parse`]
 //! parses both candidates and keeps the one that is internally consistent.
 
 use crate::structures::{
@@ -82,7 +82,7 @@ impl TextSect {
     }
 }
 
-/// One entry of `moduledata.ptab` (`runtime.ptabEntry`) — an exported symbol of
+/// One entry of `moduledata.ptab` (`runtime.ptabEntry`) - an exported symbol of
 /// a Go plugin. Both fields are offsets relative to `moduledata.types`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtabEntry<'a> {
@@ -93,8 +93,8 @@ pub struct PtabEntry<'a> {
     pub type_offset: i32,
 }
 
-/// One entry of `moduledata.pkghashes` / `modulehashes` (`runtime.modulehash`)
-/// — a per-package ABI hash used to verify plugin / shared-object
+/// One entry of `moduledata.pkghashes` / `modulehashes` (`runtime.modulehash`) -
+/// a per-package ABI hash used to verify plugin / shared-object
 /// compatibility at load time. Populated only for plugin / shared builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleHash<'a> {
@@ -105,7 +105,7 @@ pub struct ModuleHash<'a> {
     pub linktime_hash: Option<&'a str>,
 }
 
-/// A Go `bitvector` (`runtime.bitvector`): `{ n int32; bytedata *byte }` — a
+/// A Go `bitvector` (`runtime.bitvector`): `{ n int32; bytedata *byte }` - a
 /// bit count plus a pointer to the packed bit data. In moduledata these
 /// describe the GC pointer maps for the data and bss segments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -161,13 +161,13 @@ pub struct Moduledata {
     pub text: u64,
     /// End of text section.
     pub etext: u64,
-    /// `[noptrdata, enoptrdata)` — non-pointer initialized data (`.noptrdata`).
+    /// `[noptrdata, enoptrdata)` - non-pointer initialized data (`.noptrdata`).
     pub noptrdata: VaRange,
-    /// `[data, edata)` — pointer-containing initialized data (`.data`).
+    /// `[data, edata)` - pointer-containing initialized data (`.data`).
     pub data: VaRange,
-    /// `[bss, ebss)` — zero-initialized pointer-containing data (`.bss`).
+    /// `[bss, ebss)` - zero-initialized pointer-containing data (`.bss`).
     pub bss: VaRange,
-    /// `[noptrbss, enoptrbss)` — zero-initialized non-pointer data (`.noptrbss`).
+    /// `[noptrbss, enoptrbss)` - zero-initialized non-pointer data (`.noptrbss`).
     pub noptrbss: VaRange,
     /// End VA of the whole module image.
     pub end: u64,
@@ -187,7 +187,7 @@ pub struct Moduledata {
     pub etypes: u64,
     /// VA of the start of `.rodata` (Go 1.18+ / V3 / V4 / V5). `None` for V2.
     pub rodata: Option<u64>,
-    /// VA used as the base for resolving `funcdata[]` offsets — every value
+    /// VA used as the base for resolving `funcdata[]` offsets - every value
     /// returned by [`crate::structures::pclntab::ParsedPclntab::funcdata_at`]
     /// is added to this base to get the funcdata blob's VA. Go 1.18+ / V3 /
     /// V4 / V5; `None` for V2 binaries (where funcdata used a different
@@ -203,7 +203,7 @@ pub struct Moduledata {
     pub itaboffset: Option<u64>,
     /// Byte length of the itab array (Go 1.27+ / V5 only). `None` for V2-V4.
     pub itabsize: Option<u64>,
-    /// VA of `epclntab` — one past the end of the pclntab (Go 1.26+ / V4+).
+    /// VA of `epclntab` - one past the end of the pclntab (Go 1.26+ / V4+).
     /// `None` pre-1.26.
     pub epclntab: Option<u64>,
     /// inittasks slice: `[]*initTask`, the linker-built list of package
@@ -212,32 +212,32 @@ pub struct Moduledata {
     /// `textsectmap` slice (one `textsect` per text section). Length > 1 only
     /// for large binaries the linker split across multiple text sections.
     pub textsectmap: GoSlice,
-    /// `ptab` slice (`[]ptabEntry`) — exported plugin symbols. Non-empty only
+    /// `ptab` slice (`[]ptabEntry`) - exported plugin symbols. Non-empty only
     /// for `-buildmode=plugin`.
     pub ptab: GoSlice,
     /// `pluginpath` string header. Non-empty only for `-buildmode=plugin`.
     pub pluginpath: GoStr,
-    /// `pkghashes` slice (`[]modulehash`) — per-package ABI hashes used to
+    /// `pkghashes` slice (`[]modulehash`) - per-package ABI hashes used to
     /// verify plugin/shared compatibility. Non-empty only for plugin/shared.
     pub pkghashes: GoSlice,
     /// `modulename` string header. Set for plugins / shared libraries; empty
     /// for an ordinary executable.
     pub modulename: GoStr,
-    /// `modulehashes` slice (`[]modulehash`) — dependency ABI hashes for
+    /// `modulehashes` slice (`[]modulehash`) - dependency ABI hashes for
     /// plugin/shared compatibility checks.
     pub modulehashes: GoSlice,
-    /// `hasmain` flag — this module contains the program's `main` (true for
+    /// `hasmain` flag - this module contains the program's `main` (true for
     /// the main executable, false for plugins / shared libraries). Best-effort
     /// tail read; `false` if the tail was truncated.
     pub has_main: bool,
-    /// `bad` flag — the runtime marks a module that failed to load and should
+    /// `bad` flag - the runtime marks a module that failed to load and should
     /// be ignored. Best-effort tail read.
     pub bad: bool,
-    /// `gcdatamask` bitvector — GC pointer map for the data segment.
+    /// `gcdatamask` bitvector - GC pointer map for the data segment.
     pub gcdatamask: Bitvector,
-    /// `gcbssmask` bitvector — GC pointer map for the bss segment.
+    /// `gcbssmask` bitvector - GC pointer map for the bss segment.
     pub gcbssmask: Bitvector,
-    /// VA of the runtime `typemap` (`map[typeOff]*_type`) — cross-module type
+    /// VA of the runtime `typemap` (`map[typeOff]*_type`) - cross-module type
     /// deduplication map, populated at load time. `0` if absent.
     pub typemap: u64,
     /// VA of the `next` moduledata in the linked list, or `0` for the last
@@ -287,8 +287,8 @@ pub struct LayoutHints {
     /// binaries whose version was stripped or obfuscated away.
     pub go_minor: Option<u32>,
     /// Whether a `.typelink` / `__typelink` section was found. Its *absence*
-    /// is weak evidence of Go 1.27+ — PE, wasm, and RELRO ELF links spelled
-    /// `.data.rel.ro.typelink` have no such section at any version — so it is
+    /// is weak evidence of Go 1.27+ - PE, wasm, and RELRO ELF links spelled
+    /// `.data.rel.ro.typelink` have no such section at any version - so it is
     /// never used alone. See [`Moduledata::parse`].
     pub has_typelink_section: bool,
     /// Whether a `.go.type` / `__go_type` section was found. This one *is* a
@@ -339,15 +339,15 @@ impl Moduledata {
     /// V5 moved `types`' neighbours around (`+typedesclen`, `+itaboffset`,
     /// `+itabsize`, `-typelinks`, `-itablinks`), so guessing wrong shifts every
     /// field from `etypes` onward and yields a moduledata that still passes a
-    /// head-only validity check — `minpc`/`maxpc`/`funcnametab` are ahead of
-    /// the divergence — while silently reporting an empty types region, no
+    /// head-only validity check - `minpc`/`maxpc`/`funcnametab` are ahead of
+    /// the divergence - while silently reporting an empty types region, no
     /// itabs, no init tasks and `has_main == false`.
     ///
     /// The hints alone cannot settle it: PE never emits a `.typelink` section
     /// at any Go version, so on a PE binary whose version string was scrubbed
     /// the only remaining signal points the wrong way. Instead of trusting the
     /// hints, this parses *both* candidate layouts (hint-preferred first) and
-    /// returns the first one that is internally self-consistent — see
+    /// returns the first one that is internally self-consistent - see
     /// [`Moduledata::layout_self_consistent`]. Only if neither validates does
     /// the hint-preferred layout win, so callers still get the head fields.
     pub fn parse(data: &[u8], ps: u8, hints: LayoutHints) -> Option<Self> {
@@ -372,7 +372,7 @@ impl Moduledata {
         Self::parse_modern(data, ps, hints, prefer_v5)
     }
 
-    /// Whether the parsed layout is internally consistent — the arbiter used by
+    /// Whether the parsed layout is internally consistent - the arbiter used by
     /// [`Self::parse`] to decide whether it guessed V5 correctly.
     ///
     /// Checks only relationships that hold in *every* real Go image, so a
@@ -562,7 +562,7 @@ impl Moduledata {
         let textsectmap = GoSlice::parse(data, off, ps).unwrap_or_default();
         off = advance(off, slice_sz)?;
 
-        // typelinks, itablinks (slices) — removed in V5.
+        // typelinks, itablinks (slices) - removed in V5.
         let (typelinks, itablinks) = if v5 {
             (None, None)
         } else {
@@ -581,7 +581,7 @@ impl Moduledata {
         let pkghashes = GoSlice::parse(data, off, ps).unwrap_or_default();
         off = advance(off, slice_sz)?;
 
-        // inittasks []*initTask (Go 1.21+) — best-effort tail read; a malformed
+        // inittasks []*initTask (Go 1.21+) - best-effort tail read; a malformed
         // tail collapses to `None` rather than failing the whole parse.
         let inittasks = if has_inittasks {
             let it = GoSlice::parse(data, off, ps);
@@ -591,7 +591,7 @@ impl Moduledata {
             None
         };
 
-        // Tail (all best-effort — a truncated moduledata must not fail the
+        // Tail (all best-effort - a truncated moduledata must not fail the
         // whole parse, since the parser needs nothing past this point):
         //   modulename (string), modulehashes (slice), hasmain (uint8), then a
         //   version-divergent block. In Go 1.24+ `bad` moved to right after
@@ -714,7 +714,7 @@ impl Moduledata {
     /// Source: `src/runtime/symtab.go` `moduledata` (Go 1.5-1.15).
     fn parse_go12_legacy(data: &[u8], ps: u8, go_version_minor: Option<u32>) -> Option<Self> {
         // `moduledata` was introduced in Go 1.5. Go 1.2-1.4 have none, so when
-        // the version is known to predate 1.5 we refuse to parse — otherwise a
+        // the version is known to predate 1.5 we refuse to parse - otherwise a
         // pclntab-address pointer elsewhere in the image could be mistaken for
         // a (false) moduledata. When the version is unknown we still attempt it
         // and rely on the locator's structural validation.
@@ -830,7 +830,7 @@ impl Moduledata {
             (GoSlice::default(), GoStr::default(), GoSlice::default())
         };
 
-        // Tail (best-effort — a truncated moduledata must not fail the parse):
+        // Tail (best-effort - a truncated moduledata must not fail the parse):
         // modulename, modulehashes, [hasmain], gcdatamask, gcbssmask,
         // [typemap], [bad], next.
         let modulename = GoStr::parse(data, off, ps).unwrap_or_default();
@@ -952,8 +952,8 @@ fn looks_like_slice_header(data: &[u8], off: usize, ps: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// Hints for a binary with neither a `.typelink` nor a `.go.type` section
-    /// — the shape a PE, a wasm module, or a stripped RELRO ELF presents.
+    /// Hints for a binary with neither a `.typelink` nor a `.go.type` section -
+    /// the shape a PE, a wasm module, or a stripped RELRO ELF presents.
     fn hints(pclntab_version: PclntabVersion, go_minor: Option<u32>) -> LayoutHints {
         LayoutHints {
             pclntab_version,
@@ -1132,7 +1132,7 @@ mod tests {
         // Regression guard: PE binaries never carry a `.typelink` section, so
         // for a version-scrubbed PE the only hint points at V5. Reading a
         // pre-V5 moduledata with the V5 layout collapses the types span while
-        // leaving a huge `typedesclen`, which the consistency check rejects —
+        // leaving a huge `typedesclen`, which the consistency check rejects -
         // so the parser must fall back to V3 rather than return the garbage.
         let data = synthetic_v3();
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, None))
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn v5_is_never_chosen_below_the_go120_magic() {
-        // V5 requires covctrs, which the Go118 magic rules out — so even with
+        // V5 requires covctrs, which the Go118 magic rules out - so even with
         // every V5 hint set the layout must stay pre-V5.
         let data = synthetic_v5();
         let md = Moduledata::parse(

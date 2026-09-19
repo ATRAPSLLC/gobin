@@ -9,7 +9,7 @@
 //! - [`pclntab`] -- The PC/line table: function names, source files, line numbers
 //!
 //! [`moduledata`] parses the linker-generated master record that ties the rest
-//! together, and [`locate`] finds it — by section where the toolchain emits
+//! together, and [`locate`] finds it - by section where the toolchain emits
 //! one, and by scanning for its `pcHeader` pointer everywhere else.
 //!
 //! ## Why These Structures Exist
@@ -88,11 +88,11 @@ pub mod wasm;
 /// Consumers persist this enum into long-lived schemas (database columns,
 /// structured logs). The contract:
 ///
-/// - **Variants** — append-only. New architectures appear as new variants;
+/// - **Variants** - append-only. New architectures appear as new variants;
 ///   existing variants are never renamed or removed.
-/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+/// - **`Display` strings** (and [`Self::as_str`]) - fixed forever once
 ///   shipped, matching the canonical `GOARCH` values where applicable.
-/// - **`Debug` strings** — *not* a stability surface.
+/// - **`Debug` strings** - *not* a stability surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     /// x86 32-bit (`minLC=1, ptrSize=4`)
@@ -145,11 +145,11 @@ pub enum Arch {
 /// Consumers persist this enum into long-lived schemas (database columns,
 /// structured logs). The contract:
 ///
-/// - **Variants** — append-only. New format versions appear as new variants;
+/// - **Variants** - append-only. New format versions appear as new variants;
 ///   existing variants are never renamed or removed.
-/// - **`Display` strings** (and [`Self::as_str`]) — fixed forever once
+/// - **`Display` strings** (and [`Self::as_str`]) - fixed forever once
 ///   shipped.
-/// - **`Debug` strings** — *not* a stability surface.
+/// - **`Debug` strings** - *not* a stability surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PclntabVersion {
     /// Go 1.2 through 1.15 (magic `0xFFFFFFFB`).
