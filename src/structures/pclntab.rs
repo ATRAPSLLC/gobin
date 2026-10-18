@@ -116,6 +116,7 @@ use crate::{
     formats::{BinaryContext, BinaryFormat, GoSections},
     structures::{
         Arch, PclntabVersion,
+        bounds::{BoundWord, TextBound},
         util::{advance, advance_n, read_uintptr, read_uvarint, slice_at},
     },
 };
@@ -284,6 +285,49 @@ impl<'a> ParsedPclntab<'a> {
             text_start: self.text_start,
             header_text_start: self.header_text_start,
         }
+    }
+
+    /// The words of this pclntab that hold a text bound, with the address of
+    /// each; `va` is the address of the pclntab's first byte.
+    ///
+    /// - Go 1.18-1.25: the `pcHeader.textStart` field, when the linker wrote it
+    ///   ([`Self::header_text_start`]). Go 1.26 left the slot empty.
+    /// - Go 1.2-1.17: the final entry of the function table, the absolute PC
+    ///   one past the last function. The `nfunc` entries before it are the
+    ///   functions' own absolute entry PCs; each is a pointer to a function
+    ///   entry and is **not** a bound word.
+    ///
+    /// Go 1.18+ function tables hold 32-bit offsets, so they have no pointer
+    /// words. Empty when an address overflows or a word is out of range.
+    pub fn bound_words(&self, va: u64) -> Vec<BoundWord> {
+        let ps = usize::from(self.ptr_size);
+        let (offset, bound, value) = match self.version {
+            PclntabVersion::Go118 | PclntabVersion::Go120 => {
+                let Some(value) = self.header_text_start else {
+                    return Vec::new();
+                };
+                (advance_n(8, 2, ps), TextBound::HeaderTextStart, Some(value))
+            }
+            PclntabVersion::Go12 | PclntabVersion::Go116 => {
+                let offset = self
+                    .nfunc
+                    .checked_mul(2)
+                    .and_then(|words| advance_n(self.functab_offset, words, ps));
+                let value = offset.and_then(|at| read_uintptr(self.data, at, self.ptr_size));
+                (offset, TextBound::FunctabEnd, value)
+            }
+        };
+        offset
+            .zip(value)
+            .and_then(|(offset, value)| {
+                Some(BoundWord {
+                    va: va.checked_add(u64::try_from(offset).ok()?)?,
+                    bound,
+                    value,
+                })
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Infer the target architecture from `minLC` and `ptrSize`.
@@ -2120,6 +2164,53 @@ mod tests {
         let f1 = p.parse_func(150).expect("func1");
         assert_eq!(f1.entry_off, 0x100);
         assert_eq!(p.func_name(f1.name_off as u32), Some("main.worker"));
+    }
+
+    /// A legacy function table's final entry is the only bound word; the
+    /// entries before it are the functions' own absolute PCs.
+    #[test]
+    fn go12_bound_word_is_the_end_sentinel_alone() {
+        let data = build_synthetic_go12_pclntab();
+        let ctx = BinaryContext::new(&data);
+        let p = parse(&ctx).unwrap();
+
+        let words = p.bound_words(0x40_0000);
+        assert_eq!(
+            words,
+            [BoundWord {
+                va: 0x40_0000 + 16 + 2 * 2 * 8,
+                bound: TextBound::FunctabEnd,
+                value: 0x1200,
+            }]
+        );
+        // The functions' entries precede it and are not bound words.
+        for entry in [16u64, 32] {
+            assert!(words.iter().all(|word| word.va != 0x40_0000 + entry));
+        }
+    }
+
+    /// Go 1.18+ records `runtime.text` in the header when the linker wrote it,
+    /// and has no pointer words in its function table.
+    #[test]
+    fn modern_bound_word_is_the_header_text_start() {
+        let magic = [0xf1, 0xff, 0xff, 0xff];
+        let data = build_synthetic_pclntab(magic);
+        let ctx = BinaryContext::new(&data);
+        let p = parse(&ctx).unwrap();
+        assert!(p.bound_words(0x40_0000).is_empty(), "slot not written");
+
+        let mut data = build_synthetic_pclntab(magic);
+        data[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        let ctx = BinaryContext::new(&data);
+        let p = parse(&ctx).unwrap();
+        assert_eq!(
+            p.bound_words(0x40_0000),
+            [BoundWord {
+                va: 0x40_0000 + 24,
+                bound: TextBound::HeaderTextStart,
+                value: 0x401000,
+            }]
+        );
     }
 
     #[test]

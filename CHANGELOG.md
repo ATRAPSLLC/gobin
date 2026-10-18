@@ -5,6 +5,48 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0]
+
+The runtime's own statements of where its code and build ID sit, so consumers
+read these facts from gobin instead of re-deriving Go layout knowledge.
+
+### Added
+
+- `GoBinary::text_bound_words`, the addresses of the words that hold the
+  runtime's text bounds (`BoundWord`, `TextBound`): the `moduledata` fields
+  `minpc`, `maxpc`, `text` and `etext`, the `baseaddr` of each `textsectmap`
+  entry, `pcHeader.textStart` (Go 1.18-1.25) and the end sentinel of a Go
+  1.2-1.17 function table. These words state where the code ends and point at
+  no function, so a tool collecting data words that hold code addresses can
+  drop them by site. The other entries of a Go 1.2-1.17 function table are
+  function entry PCs and are not reported; a Go 1.18+ table holds 32-bit
+  offsets and no pointer words. `Moduledata::bound_words` (the four fields
+  and the section bases), `ParsedPclntab::bound_words` and
+  `BinaryContext::view_to_va` carry the pieces.
+- `GoBinary::build_id_blob`, the file-offset extent of the raw build ID blob
+  from its opening marker `\xff Go build ID: "` through its closing marker
+  `"\n \xff` (Mach-O, PE and wasm). `None` when the build ID came from an ELF
+  note.
+- `GoBinary::text_section_end_va`, the end of the `textsectmap` section that
+  holds the last byte of Go code: where the Go linker ended its text, which a
+  host linker's C code may follow.
+- `TextSect::va_range`, the addresses a text section spans.
+- `bounds::TEXT_SYMBOL` and `bounds::ETEXT_SYMBOL`, the linker symbol names
+  `runtime.text` and `runtime.etext`.
+
+### Fixed
+
+- The `TextSect` field docs called `vaddr` and `end` virtual addresses. They
+  are offsets from `runtime.text`; only `baseaddr` is an address.
+
+### Changed - breaking
+
+- `ModuledataLocator::locate` returns a `LocatedModuledata` (the moduledata and
+  its offset in the address-space view) instead of the bare `Moduledata`.
+- `buildid::extract` returns a `BuildId` (the ID and its `BuildIdSource`: the
+  ELF note, or the raw marker with its file extent) instead of the bare
+  `&str`. `GoBinary::build_id` is unchanged.
+
 ## [0.5.1]
 
 Maintenance release. No functional change.
@@ -718,6 +760,7 @@ Initial public release.
 - Type descriptor extraction via `.typelink` and descriptor walking.
 - Heuristic confidence scoring (`Confidence` enum).
 
+[0.6.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.4.0...v0.4.1

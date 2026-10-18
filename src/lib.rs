@@ -80,6 +80,8 @@ pub mod formats;
 pub mod metadata;
 pub mod structures;
 
+use std::ops::Range;
+
 use crate::{
     detection::{
         Confidence, ConfidenceReport, ConfidenceSignal, ParseError, VersionSource, find_bytes,
@@ -88,10 +90,13 @@ use crate::{
     formats::{BinaryContext, BinaryFormat},
     metadata::{BuildInfo, Compiler, FipsInfo, FunctionIter, InitFunc, InitTask, ObfuscationKind},
     structures::{
-        Arch, PclntabVersion, buildid, buildinfo, embed, gcprog,
+        Arch, PclntabVersion,
+        bounds::BoundWord,
+        buildid::{self, BuildId, BuildIdSource},
+        buildinfo, embed, gcprog,
         goslice::{GoSlice, GoStr},
         inittask, inline, itab,
-        locate::ModuledataLocator,
+        locate::{LocatedModuledata, ModuledataLocator},
         moduledata::{LayoutHints, ModuleHash, Moduledata, ModuledataVersion, PtabEntry, TextSect},
         name::decode_name,
         pclntab::{self, FuncData, ParsedPclntab, PclntabMeta},
@@ -116,7 +121,7 @@ use crate::{
 pub struct GoBinary<'a> {
     report: ConfidenceReport,
     ctx: BinaryContext<'a>,
-    build_id: Option<&'a str>,
+    build_id: Option<BuildId<'a>>,
     build_info: Option<BuildInfo<'a>>,
     /// Cached pclntab scalars. The borrowing [`ParsedPclntab`] view is
     /// reconstructed on demand via [`Self::pclntab`] so it can borrow from
@@ -126,6 +131,9 @@ pub struct GoBinary<'a> {
     pclntab_meta: Option<PclntabMeta>,
     go_version: Option<&'a str>,
     moduledata: Option<Moduledata>,
+    /// Offset of [`Self::moduledata`] in the address-space view
+    /// ([`BinaryContext::structure_search_data`]).
+    moduledata_offset: Option<usize>,
 }
 
 impl<'a> GoBinary<'a> {
@@ -258,10 +266,12 @@ impl<'a> GoBinary<'a> {
             return Err(ParseError::NotAGoBinary { report });
         }
 
-        let moduledata = pclntab_meta.and_then(|meta| {
+        let located = pclntab_meta.and_then(|meta| {
             let pcl = meta.attach(ctx.structure_search_data())?;
             find_moduledata(&ctx, &pcl, go_version)
         });
+        let moduledata_offset = located.as_ref().map(|found| found.offset);
+        let moduledata = located.map(|found| found.moduledata);
 
         Ok(GoBinary {
             report,
@@ -271,6 +281,7 @@ impl<'a> GoBinary<'a> {
             pclntab_meta,
             go_version,
             moduledata,
+            moduledata_offset,
         })
     }
 
@@ -313,7 +324,25 @@ impl<'a> GoBinary<'a> {
     ///
     /// See [`structures::buildid`] for format details.
     pub fn build_id(&self) -> Option<&'a str> {
-        self.build_id
+        self.build_id.as_ref().map(|build_id| build_id.id)
+    }
+
+    /// File-offset extent of the raw build ID blob, from the first byte of the
+    /// opening marker `\xff Go build ID: "` through the last byte of the
+    /// closing marker `"\n \xff`.
+    ///
+    /// The blob is the `go:buildid` symbol the linker places at or near the
+    /// start of the text on Mach-O and PE, and the `go:buildid` custom section
+    /// of a wasm module. `None` when [`Self::build_id`] came from an ELF note
+    /// (where the Go linker puts it on ELF) or there is no build ID. The range
+    /// indexes [`BinaryContext::data`]; [`BinaryContext::file_to_va`] maps it
+    /// to the address space where the blob is loaded (a wasm custom section
+    /// is not).
+    pub fn build_id_blob(&self) -> Option<Range<usize>> {
+        match &self.build_id.as_ref()?.source {
+            BuildIdSource::Marker { blob } => Some(blob.clone()),
+            BuildIdSource::ElfNote => None,
+        }
     }
 
     /// Build metadata including module path, dependencies, and build settings.
@@ -501,6 +530,68 @@ impl<'a> GoBinary<'a> {
     /// useful as an "amount of Go code in this binary" metric.
     pub fn etext_va(&self) -> Option<u64> {
         self.moduledata.as_ref().map(|m| m.etext)
+    }
+
+    /// End of the `textsectmap` section that holds the last byte of Go code:
+    /// the first address past the section whose range contains
+    /// `etext_va() - 1`.
+    ///
+    /// The section is the one the Go linker laid out, so it may end past
+    /// [`Self::etext_va`] where that linker padded it (across the sample
+    /// corpus by 1 to 20 bytes from Go 1.21 on, internally and externally
+    /// linked alike, and not at all before). A host linker that places C code
+    /// after Go's leaves this section where Go put it, so its end need not be
+    /// the end of the containing executable section.
+    ///
+    /// `None` without a moduledata, before Go 1.8 (no `textsectmap`), or when
+    /// no section holds that byte.
+    pub fn text_section_end_va(&self) -> Option<u64> {
+        let etext = self.etext_va()?;
+        self.text_sections()
+            .iter()
+            .filter_map(TextSect::va_range)
+            .find(|range| range.start < etext && etext <= range.end)
+            .map(|range| range.end)
+    }
+
+    /// The words of the image that hold a text bound, ascending by address.
+    ///
+    /// These are the runtime's own statements of where its code begins and
+    /// ends, not pointers to functions: the `moduledata` words `minpc`,
+    /// `maxpc`, `text` and `etext`, the base address of each `textsectmap`
+    /// entry, the `pcHeader.textStart` field (Go 1.18-1.25) and the end
+    /// sentinel of a Go 1.2-1.17 function table (see
+    /// [`TextBound`](structures::bounds::TextBound)). A tool that collects the
+    /// data words holding code addresses can drop these by
+    /// [`BoundWord::va`] and keep every other word, including the function
+    /// table's own entries: in a Go 1.2-1.17 binary each entry before the
+    /// sentinel is the absolute entry PC of a function and stays a legitimate
+    /// code pointer; in Go 1.18+ the table holds 32-bit offsets and no
+    /// pointers at all.
+    ///
+    /// Addresses are in the same space as [`Self::text_va`] (for PE the image
+    /// base is included). Each word that cannot be placed - no moduledata, no
+    /// pclntab, an unmapped offset - is left out, so the list is empty for a
+    /// binary whose runtime structures were not found.
+    pub fn text_bound_words(&self) -> Vec<BoundWord> {
+        let Some(ps) = self.pclntab_meta.map(|meta| meta.ptr_size) else {
+            return Vec::new();
+        };
+        let mut words = Vec::new();
+        if let Some(pcl) = self.pclntab()
+            && let Some(va) = self.ctx.view_to_va(pcl.offset)
+        {
+            words.extend(pcl.bound_words(va));
+        }
+        if let Some(md) = self.moduledata.as_ref()
+            && let Some(va) = self
+                .moduledata_offset
+                .and_then(|offset| self.ctx.view_to_va(offset))
+        {
+            words.extend(md.bound_words(va, ps, &self.text_sections()));
+        }
+        words.sort_unstable_by_key(|word| word.va);
+        words
     }
 
     /// Whether this module contains the program's `main` - true for the main
@@ -1278,8 +1369,8 @@ fn parse_go_minor_version(version: &str) -> Option<u32> {
     minor_str.parse().ok()
 }
 
-/// Locate and parse the moduledata for accessor-only use (text/etext/types
-/// region addresses).
+/// Locate and parse the moduledata, with its position in the address-space
+/// view, for accessor-only use (text/etext/types region addresses).
 ///
 /// Delegates to [`ModuledataLocator`], which owns every discovery strategy -
 /// the `.go.module` section on Go 1.26+ ELF / Mach-O, and the `pcHeader`-
@@ -1290,7 +1381,7 @@ fn find_moduledata(
     ctx: &BinaryContext<'_>,
     pclntab: &ParsedPclntab<'_>,
     go_version: Option<&str>,
-) -> Option<Moduledata> {
+) -> Option<LocatedModuledata> {
     let hints = layout_hints(ctx, pclntab.version, go_version);
     ModuledataLocator::new(ctx, pclntab.ptr_size, pclntab.offset, hints).locate()
 }

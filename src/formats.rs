@@ -581,6 +581,21 @@ impl<'a> BinaryContext<'a> {
         None
     }
 
+    /// The address the byte at `offset` of [`Self::structure_search_data`] has
+    /// when the image is loaded.
+    ///
+    /// For wasm the view is linear memory, so the offset is the address. For
+    /// every other format it is the file-offset-to-VA translation
+    /// ([`Self::file_to_va`]); on chained-fixup Mach-O the view is the rebased
+    /// copy, which has the file's layout.
+    pub fn view_to_va(&self, offset: usize) -> Option<u64> {
+        if self.format() == BinaryFormat::Wasm {
+            u64::try_from(offset).ok()
+        } else {
+            self.file_to_va(offset)
+        }
+    }
+
     /// Bytes used by the pclntab/moduledata parsers as their address space.
     ///
     /// For wasm this is the reconstructed linear-memory image (covering all
