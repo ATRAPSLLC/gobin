@@ -25,6 +25,15 @@ use crate::{
     structures::moduledata::{LayoutHints, Moduledata, ModuledataVersion},
 };
 
+/// A moduledata and where the locator found it.
+#[derive(Debug, Clone)]
+pub struct LocatedModuledata {
+    /// The parsed structure.
+    pub moduledata: Moduledata,
+    /// Offset of its first byte in [`BinaryContext::structure_search_data`].
+    pub offset: usize,
+}
+
 /// Locates and parses a binary's `moduledata`.
 ///
 /// Construct once per binary and call [`Self::locate`]; the result is worth
@@ -61,9 +70,9 @@ impl<'a> ModuledataLocator<'a> {
         }
     }
 
-    /// Find and parse the moduledata, or return `None` if neither strategy
-    /// yields a structurally valid one.
-    pub fn locate(&self) -> Option<Moduledata> {
+    /// Find and parse the moduledata, with where it sits, or return `None` if
+    /// neither strategy yields a structurally valid one.
+    pub fn locate(&self) -> Option<LocatedModuledata> {
         if !self.ctx.has_va_mapping() || self.ptr_size == 0 {
             return None;
         }
@@ -73,11 +82,16 @@ impl<'a> ModuledataLocator<'a> {
     /// Parse the moduledata out of the dedicated `.go.module` / `__go_module`
     /// section (Go 1.26+ ELF and Mach-O). No search needed - the section *is*
     /// the structure.
-    fn in_section(&self) -> Option<Moduledata> {
+    fn in_section(&self) -> Option<LocatedModuledata> {
         let range = self.ctx.sections().go_module.as_ref()?;
         let data = self.ctx.structure_search_data();
         let end = range.offset.checked_add(range.size)?;
-        Moduledata::parse(data.get(range.offset..end)?, self.ptr_size, self.hints)
+        let moduledata =
+            Moduledata::parse(data.get(range.offset..end)?, self.ptr_size, self.hints)?;
+        Some(LocatedModuledata {
+            moduledata,
+            offset: range.offset,
+        })
     }
 
     /// Scan the address-space view for the `pcHeader` pointer and parse the
@@ -89,7 +103,7 @@ impl<'a> ModuledataLocator<'a> {
     /// image, and searching it first turns a whole-file sweep into a few tens
     /// of kilobytes. The full image remains the fallback, so a stripped or
     /// unusual section table costs correctness nothing.
-    fn by_scan(&self) -> Option<Moduledata> {
+    fn by_scan(&self) -> Option<LocatedModuledata> {
         let data = self.ctx.structure_search_data();
         let target = self.scan_target()?;
 
@@ -113,18 +127,11 @@ impl<'a> ModuledataLocator<'a> {
     }
 
     /// The pointer value the scan looks for: the pclntab's address in whatever
-    /// address space `structure_search_data` presents.
-    ///
-    /// For wasm that view *is* linear memory, so the pclntab's offset into it
-    /// is already the address the runtime stored. Every other format needs the
-    /// file-offset-to-VA translation. On chained-fixup Mach-O the view is the
-    /// rebased copy, so the stored pointer is a real VA by the time we see it.
+    /// address space `structure_search_data` presents ([`BinaryContext::view_to_va`]).
+    /// On chained-fixup Mach-O the view is the rebased copy, so the stored
+    /// pointer is a real VA by the time we see it.
     fn scan_target(&self) -> Option<u64> {
-        if self.ctx.format() == BinaryFormat::Wasm {
-            Some(self.pclntab_offset as u64)
-        } else {
-            self.ctx.file_to_va(self.pclntab_offset)
-        }
+        self.ctx.view_to_va(self.pclntab_offset)
     }
 
     /// Scan `[start, start + len)` of `data` for `target` at pointer-aligned
@@ -139,7 +146,7 @@ impl<'a> ModuledataLocator<'a> {
         start: usize,
         len: usize,
         target: u64,
-    ) -> Option<Moduledata> {
+    ) -> Option<LocatedModuledata> {
         let p = self.ptr_size as usize;
         // Align the start up to a pointer boundary; the linker never places
         // moduledata unaligned, and a misaligned scan would double the work.
@@ -159,12 +166,15 @@ impl<'a> ModuledataLocator<'a> {
             let Some(at) = i.checked_mul(p).and_then(|o| o.checked_add(start)) else {
                 continue;
             };
-            if let Some(md) = data
+            if let Some(moduledata) = data
                 .get(at..)
                 .and_then(|rest| Moduledata::parse(rest, self.ptr_size, self.hints))
-                && self.accept(&md)
+                && self.accept(&moduledata)
             {
-                return Some(md);
+                return Some(LocatedModuledata {
+                    moduledata,
+                    offset: at,
+                });
             }
         }
         None

@@ -25,8 +25,11 @@
 //! carries no `.typelink` section at *any* Go version - so [`Moduledata::parse`]
 //! parses both candidates and keeps the one that is internally consistent.
 
+use std::ops::Range;
+
 use crate::structures::{
     PclntabVersion,
+    bounds::{BoundWord, TextBound},
     goslice::{GoSlice, GoStr},
     util::{advance, align_up, read_uintptr},
 };
@@ -57,11 +60,13 @@ impl VaRange {
 /// across multiple text sections in a large binary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextSect {
-    /// Virtual address of the section start.
+    /// Offset of the section start from `runtime.text` (zero for the first
+    /// section).
     pub vaddr: u64,
-    /// Virtual address one past the section end.
+    /// Offset one past the section end from `runtime.text`, so the section is
+    /// `end - vaddr` bytes long.
     pub end: u64,
-    /// Base address the section was relocated to.
+    /// Address the section starts at.
     pub baseaddr: u64,
 }
 
@@ -79,6 +84,24 @@ impl TextSect {
             end: read_uintptr(data, offset.checked_add(p)?, ps)?,
             baseaddr: read_uintptr(data, offset.checked_add(p.checked_mul(2)?)?, ps)?,
         })
+    }
+
+    /// The addresses the section spans: from `baseaddr`, for `end - vaddr`
+    /// bytes. `None` when `end` precedes `vaddr` or the end overflows.
+    pub fn va_range(&self) -> Option<Range<u64>> {
+        let len = self.end.checked_sub(self.vaddr)?;
+        Some(self.baseaddr..self.baseaddr.checked_add(len)?)
+    }
+
+    /// The address of the word that holds `baseaddr` in entry `index` of an
+    /// array of entries starting at `array_va`, or `None` on overflow.
+    ///
+    /// `baseaddr` is the entry's third field, the only one that is an address:
+    /// `vaddr` and `end` are offsets from `runtime.text`.
+    fn base_word_va(array_va: u64, index: usize, ps: u8) -> Option<u64> {
+        let entry = u64::try_from(index.checked_mul(Self::size(ps))?).ok()?;
+        let field = u64::from(ps).checked_mul(2)?;
+        array_va.checked_add(entry)?.checked_add(field)
     }
 }
 
@@ -370,6 +393,50 @@ impl Moduledata {
             }
         }
         Self::parse_modern(data, ps, hints, prefer_v5)
+    }
+
+    /// The words of this moduledata that hold a text bound, with the address
+    /// of each: `minpc`, `maxpc`, `text` and `etext`, then the `baseaddr` of
+    /// each `textsectmap` entry.
+    ///
+    /// `va` is the address of the moduledata, `ps` the pointer size in bytes
+    /// and `sections` the decoded `textsectmap` entries. The four fields
+    /// follow the head of the layout: for Go 1.16+ the `pcHeader` pointer, six
+    /// slice headers and `findfunctab` (twenty pointer-sized words), for the
+    /// legacy Go 1.5-1.15 layout three slice headers and `findfunctab` (ten).
+    /// A word whose address overflows is left out.
+    pub fn bound_words(&self, va: u64, ps: u8, sections: &[TextSect]) -> Vec<BoundWord> {
+        let head_words: u64 = if self.version == ModuledataVersion::V1 {
+            10
+        } else {
+            20
+        };
+        [
+            (TextBound::MinPc, self.minpc),
+            (TextBound::MaxPc, self.maxpc),
+            (TextBound::Text, self.text),
+            (TextBound::Etext, self.etext),
+        ]
+        .into_iter()
+        .zip(head_words..)
+        .filter_map(|((bound, value), word)| {
+            let site = word
+                .checked_mul(u64::from(ps))
+                .and_then(|offset| va.checked_add(offset))?;
+            Some(BoundWord {
+                va: site,
+                bound,
+                value,
+            })
+        })
+        .chain(sections.iter().enumerate().filter_map(|(index, section)| {
+            Some(BoundWord {
+                va: TextSect::base_word_va(self.textsectmap.ptr, index, ps)?,
+                bound: TextBound::SectionBase,
+                value: section.baseaddr,
+            })
+        }))
+        .collect()
     }
 
     /// Whether the parsed layout is internally consistent - the arbiter used by
@@ -1243,6 +1310,150 @@ mod tests {
         assert!(md.rodata.is_none());
         assert!(md.gofunc.is_none());
         assert_eq!(md.funcnametab.ptr, 0);
+    }
+
+    /// The bound words sit at the head offsets of each layout, so reading the
+    /// word at a reported address gives the bound it states.
+    #[test]
+    fn bound_words_sit_at_the_head_of_every_layout() {
+        let base = 0x60_0000u64;
+        let read = |data: &[u8], word: &BoundWord| {
+            let offset = usize::try_from(word.va - base).unwrap();
+            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+        };
+        let mut v5 = synthetic_v5();
+        put(&mut v5, 160, 0x401000); // minpc
+        put(&mut v5, 168, 0x49fff1); // maxpc
+        let mut legacy = vec![0u8; 512];
+        put(&mut legacy, 80, 0x1000);
+        put(&mut legacy, 88, 0x1ff0);
+        put(&mut legacy, 96, 0x1000);
+        put(&mut legacy, 104, 0x2000);
+        for (data, hints, offset) in [
+            (v5, hints(PclntabVersion::Go120, Some(27)), 160),
+            (synthetic_v3(), hints(PclntabVersion::Go120, Some(25)), 160),
+            (legacy, hints(PclntabVersion::Go12, Some(10)), 80),
+        ] {
+            let md = Moduledata::parse(&data, 8, hints).expect("moduledata should parse");
+            let words = md.bound_words(base, 8, &[]);
+            let bounds: Vec<_> = words.iter().map(|word| word.bound).collect();
+            assert_eq!(
+                bounds,
+                [
+                    TextBound::MinPc,
+                    TextBound::MaxPc,
+                    TextBound::Text,
+                    TextBound::Etext
+                ],
+                "{:?}",
+                md.version
+            );
+            for (index, word) in words.iter().enumerate() {
+                assert_eq!(
+                    word.va,
+                    base + offset + 8 * index as u64,
+                    "{:?}",
+                    md.version
+                );
+                assert_eq!(word.value, read(&data, word), "{:?}", md.version);
+            }
+            assert_eq!(words[2].value, md.text);
+            assert_eq!(words[3].value, md.etext);
+        }
+    }
+
+    /// A 32-bit image has four-byte words, so the head is half as wide.
+    #[test]
+    fn bound_words_follow_the_pointer_size() {
+        let mut data = vec![0u8; 256];
+        data[40..44].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[44..48].copy_from_slice(&0x2000u32.to_le_bytes());
+        data[48..52].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[52..56].copy_from_slice(&0x2000u32.to_le_bytes());
+        let md = Moduledata::parse(&data, 4, hints(PclntabVersion::Go12, Some(10)))
+            .expect("32-bit legacy moduledata should parse");
+        let sites: Vec<u64> = md
+            .bound_words(0x1000, 4, &[])
+            .iter()
+            .map(|w| w.va)
+            .collect();
+        assert_eq!(sites, [0x1028, 0x102c, 0x1030, 0x1034]);
+    }
+
+    /// Each text section's base follows the four fields, at the third word of
+    /// its `textsectmap` entry.
+    #[test]
+    fn bound_words_include_each_section_base() {
+        let mut md = Moduledata::parse(&synthetic_v3(), 8, hints(PclntabVersion::Go120, Some(25)))
+            .expect("moduledata should parse");
+        md.textsectmap = GoSlice {
+            ptr: 0x5000,
+            len: 2,
+            cap: 2,
+        };
+        let sections = [
+            TextSect {
+                vaddr: 0,
+                end: 0x10_0000,
+                baseaddr: 0x40_1000,
+            },
+            TextSect {
+                vaddr: 0x10_0000,
+                end: 0x18_0000,
+                baseaddr: 0x50_2000,
+            },
+        ];
+        let words = md.bound_words(0x60_0000, 8, &sections);
+        assert_eq!(words.len(), 6);
+        assert_eq!(
+            words[4..],
+            [
+                BoundWord {
+                    va: 0x5010,
+                    bound: TextBound::SectionBase,
+                    value: 0x40_1000,
+                },
+                BoundWord {
+                    va: 0x5028,
+                    bound: TextBound::SectionBase,
+                    value: 0x50_2000,
+                },
+            ]
+        );
+    }
+
+    /// A section spans `end - vaddr` bytes from its base; a malformed entry
+    /// spans nothing.
+    #[test]
+    fn a_text_section_spans_from_its_base() {
+        let section = TextSect {
+            vaddr: 0x10_0000,
+            end: 0x18_0000,
+            baseaddr: 0x50_2000,
+        };
+        assert_eq!(section.va_range(), Some(0x50_2000..0x58_2000));
+        let backwards = TextSect {
+            vaddr: 2,
+            end: 1,
+            baseaddr: 0,
+        };
+        assert_eq!(backwards.va_range(), None);
+        let overflow = TextSect {
+            vaddr: 0,
+            end: 2,
+            baseaddr: u64::MAX,
+        };
+        assert_eq!(overflow.va_range(), None);
+    }
+
+    /// Only a text section's `baseaddr` is an address; its word is the third
+    /// of the entry.
+    #[test]
+    fn a_text_section_holds_its_base_address_in_the_third_word() {
+        assert_eq!(TextSect::base_word_va(0x5000, 0, 8), Some(0x5010));
+        assert_eq!(TextSect::base_word_va(0x5000, 2, 8), Some(0x5000 + 48 + 16));
+        assert_eq!(TextSect::base_word_va(0x5000, 1, 4), Some(0x5000 + 12 + 8));
+        assert_eq!(TextSect::base_word_va(u64::MAX, 0, 8), None);
     }
 
     #[test]

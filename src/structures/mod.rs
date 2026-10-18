@@ -10,7 +10,8 @@
 //!
 //! [`moduledata`] parses the linker-generated master record that ties the rest
 //! together, and [`locate`] finds it - by section where the toolchain emits
-//! one, and by scanning for its `pcHeader` pointer everywhere else.
+//! one, and by scanning for its `pcHeader` pointer everywhere else. [`bounds`]
+//! names the words of those structures that hold the bounds of the text.
 //!
 //! ## Why These Structures Exist
 //!
@@ -28,6 +29,7 @@
 
 pub mod abitype;
 pub mod arraytype;
+pub mod bounds;
 pub mod buildid;
 pub mod buildinfo;
 pub mod chantype;

@@ -2286,7 +2286,11 @@ mod matrix {
     use super::*;
     use gobin::{
         formats::BinaryFormat,
-        structures::{Arch, PclntabVersion, moduledata::ModuledataVersion},
+        structures::{
+            Arch, PclntabVersion,
+            bounds::{ETEXT_SYMBOL, TEXT_SYMBOL, TextBound},
+            moduledata::ModuledataVersion,
+        },
     };
 
     pub struct Fixture {
@@ -2633,6 +2637,320 @@ mod matrix {
                     );
                 }
             }
+        }
+    }
+
+    /// The pointer-sized word at `va`, read through the address space.
+    fn word_at(bin: &GoBinary<'_>, va: u64) -> Option<u64> {
+        let ps = bin.pclntab()?.ptr_size;
+        let bytes = bin.context().slice_at_va(va)?;
+        match ps {
+            4 => Some(u64::from(u32::from_le_bytes(
+                bytes.get(..4)?.try_into().ok()?,
+            ))),
+            8 => Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+            _ => None,
+        }
+    }
+
+    /// Every bound word holds, at its address, the bound it states; the words
+    /// are the ones the toolchain's layout has, no more.
+    fn check_bound_words(path: &str, minor: u32) {
+        let data = load(path);
+        let bin = GoBinary::parse(&data).unwrap_or_else(|| panic!("{path}: parse failed"));
+        let words = bin.text_bound_words();
+        assert!(
+            words.windows(2).all(|pair| pair[0].va < pair[1].va),
+            "{path}: ascending, no address twice"
+        );
+        for word in &words {
+            assert_eq!(
+                word_at(&bin, word.va),
+                Some(word.value),
+                "{path}: the word at {:#x} ({:?}) holds {:#x}",
+                word.va,
+                word.bound,
+                word.value
+            );
+        }
+        let of = |bound: TextBound| {
+            words
+                .iter()
+                .filter(|w| w.bound == bound)
+                .collect::<Vec<_>>()
+        };
+
+        // moduledata: the four bounds, and one base address per text section.
+        match bin.moduledata() {
+            Some(md) => {
+                for (bound, value) in [
+                    (TextBound::MinPc, md.minpc),
+                    (TextBound::MaxPc, md.maxpc),
+                    (TextBound::Text, md.text),
+                    (TextBound::Etext, md.etext),
+                ] {
+                    let found = of(bound);
+                    assert_eq!(found.len(), 1, "{path}: one {bound:?} word");
+                    assert_eq!(found[0].value, value, "{path}: {bound:?}");
+                }
+                let sections = bin.text_sections();
+                // `textsectmap` arrived in Go 1.8.
+                assert_eq!(!sections.is_empty(), minor >= 8, "{path}: text sections");
+                let bases = of(TextBound::SectionBase);
+                assert_eq!(bases.len(), sections.len(), "{path}: one base per section");
+                for (word, section) in bases.iter().zip(&sections) {
+                    assert_eq!(word.value, section.baseaddr, "{path}: section base");
+                }
+            }
+            None => {
+                for bound in [
+                    TextBound::MinPc,
+                    TextBound::MaxPc,
+                    TextBound::Text,
+                    TextBound::Etext,
+                    TextBound::SectionBase,
+                ] {
+                    assert!(of(bound).is_empty(), "{path}: no moduledata, no {bound:?}");
+                }
+            }
+        }
+
+        // pcHeader.textStart: written by Go 1.18 through 1.25 only, and zero
+        // in wasm, where the code starts at address 0.
+        let header = of(TextBound::HeaderTextStart);
+        if (18..=25).contains(&minor) && bin.context().format() != BinaryFormat::Wasm {
+            assert_eq!(header.len(), 1, "{path}: pcHeader.textStart");
+            assert_eq!(Some(header[0].value), bin.moduledata().map(|m| m.text));
+        } else {
+            assert!(header.is_empty(), "{path}: no pcHeader.textStart");
+        }
+
+        // Function table: absolute PCs up to Go 1.17, whose end sentinel is
+        // the one bound; every entry before it is a function's own entry PC.
+        let end = of(TextBound::FunctabEnd);
+        if minor > 17 {
+            assert!(end.is_empty(), "{path}: offsets, not pointers");
+            return;
+        }
+        let pcl = bin.pclntab().unwrap();
+        let ps = u64::from(pcl.ptr_size);
+        let table = bin.context().view_to_va(pcl.offset).unwrap() + pcl.functab_offset as u64;
+        assert_eq!(end.len(), 1, "{path}: one end sentinel");
+        assert_eq!(
+            end[0].va,
+            table + 2 * pcl.nfunc as u64 * ps,
+            "{path}: sentinel site"
+        );
+        if let Some(md) = bin.moduledata() {
+            assert_eq!(end[0].value, md.maxpc, "{path}: sentinel is maxpc");
+        }
+        let mut entries = 0usize;
+        for (index, (entry_off, _)) in pcl.func_entries().enumerate() {
+            let site = table + 2 * index as u64 * ps;
+            assert!(
+                words.iter().all(|word| word.va != site),
+                "{path}: entry {index} is a function pointer, not a bound"
+            );
+            assert_eq!(
+                word_at(&bin, site),
+                Some(pcl.text_start + u64::from(entry_off)),
+                "{path}: entry {index} holds the function's entry PC"
+            );
+            entries += 1;
+        }
+        assert_eq!(entries, pcl.nfunc, "{path}: every entry visited");
+    }
+
+    #[test]
+    fn bound_words_hold_their_bounds_across_corpus() {
+        let fixtures = discover();
+        for fx in &fixtures {
+            check_bound_words(&fx.path, tag_minor(&fx.gotag));
+        }
+        // Old absolute tables, 1.18+ headers, 1.26 and 1.27 layouts, every
+        // format and the wasm address space are all among the fixtures.
+        let minors: BTreeSet<u32> = fixtures.iter().map(|f| tag_minor(&f.gotag)).collect();
+        for want in [5, 10, 16, 17, 18, 20, 24, 25, 26, 27] {
+            assert!(minors.contains(&want), "no Go 1.{want} fixture");
+        }
+        for goos in ["linux", "darwin", "windows", "wasip1"] {
+            assert!(fixtures.iter().any(|f| f.goos == goos), "no {goos} fixture");
+        }
+    }
+
+    #[test]
+    fn bound_words_survive_a_scrubbed_version_string() {
+        // The layout is then chosen by arbitration, and the words are still
+        // where the bounds are.
+        check_bound_words(BASIC_GO124_WINDOWS_NOVERSION, 24);
+    }
+
+    /// The three words that started a function over `runtime.etext` in an
+    /// externally linked Go 1.16 image are bound words, found at the
+    /// addresses the image holds them.
+    #[test]
+    fn cgo_go116_bound_words_include_the_etext_holders() {
+        let data = load("tests/samples/cgo_go116_linux_amd64");
+        let bin = GoBinary::parse(&data).unwrap();
+        let etext = bin.etext_va().unwrap();
+        let sites: BTreeSet<(u64, TextBound)> = bin
+            .text_bound_words()
+            .iter()
+            .filter(|word| word.value == etext)
+            .map(|word| (word.va, word.bound))
+            .collect();
+        assert_eq!(
+            sites,
+            BTreeSet::from([
+                (0x5471a8, TextBound::MaxPc),
+                (0x5471b8, TextBound::Etext),
+                (0x51b8c0, TextBound::FunctabEnd),
+            ])
+        );
+    }
+
+    /// Every fixture that carries a raw build ID marker reports its blob, and
+    /// the blob is the marker framing exactly the build ID; an ELF build ID
+    /// comes from the note and has none.
+    #[test]
+    fn build_id_blob_frames_the_build_id_across_corpus() {
+        const OPEN: &[u8] = b"\xff Go build ID: \"";
+        const CLOSE: &[u8] = b"\"\n \xff";
+        let mut paths: Vec<String> = discover().into_iter().map(|f| f.path).collect();
+        paths.push(BASIC_GO124_WINDOWS_NOVERSION.to_string());
+        paths.push("tests/samples/plugin_go126_darwin_arm64.so".to_string());
+        let mut framed = BTreeSet::new();
+        for path in &paths {
+            let data = load(path);
+            let bin = GoBinary::parse(&data).unwrap_or_else(|| panic!("{path}: parse failed"));
+            let format = bin.context().format();
+            let Some(blob) = bin.build_id_blob() else {
+                assert!(
+                    format == BinaryFormat::Elf || bin.build_id().is_none(),
+                    "{path}: a {format:?} build ID has a blob"
+                );
+                continue;
+            };
+            assert_ne!(format, BinaryFormat::Elf, "{path}: ELF carries a note");
+            let bytes = &data[blob.clone()];
+            let id = bin.build_id().unwrap().as_bytes();
+            assert_eq!(bytes.len(), OPEN.len() + id.len() + CLOSE.len(), "{path}");
+            assert!(bytes.starts_with(OPEN), "{path}: opening marker");
+            assert!(bytes.ends_with(CLOSE), "{path}: closing marker");
+            assert_eq!(&bytes[OPEN.len()..bytes.len() - CLOSE.len()], id, "{path}");
+            // On Mach-O and PE the blob is `go:buildid`, a text symbol.
+            if format != BinaryFormat::Wasm {
+                let text = bin.context().sections().text_section.unwrap();
+                let va = bin.context().file_to_va(blob.start).unwrap();
+                assert!(
+                    (text.va..text.va + text.size as u64).contains(&va),
+                    "{path}: blob at {va:#x} is in the text"
+                );
+            }
+            framed.insert(format!("{format:?}"));
+        }
+        assert_eq!(
+            framed,
+            BTreeSet::from(["MachO".into(), "Pe".into(), "Wasm".into()])
+        );
+    }
+
+    /// The ELF note is the only build ID an ELF image carries.
+    #[test]
+    fn build_id_blob_is_absent_for_an_elf_note() {
+        let data = load(BASIC_GO127_LINUX);
+        let bin = GoBinary::parse(&data).unwrap();
+        assert!(bin.context().sections().has_go_buildid_note);
+        assert!(bin.build_id().is_some());
+        assert_eq!(bin.build_id_blob(), None);
+    }
+
+    /// The section holding the last Go byte ends at or past `etext`, and only
+    /// binaries with a `textsectmap` have one.
+    #[test]
+    fn text_section_end_holds_etext_across_corpus() {
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let path = &fx.path;
+            let Some(end) = bin.text_section_end_va() else {
+                assert!(
+                    bin.text_sections().is_empty(),
+                    "{path}: a section holds etext"
+                );
+                continue;
+            };
+            let etext = bin.etext_va().unwrap();
+            assert!(
+                end >= etext,
+                "{path}: {end:#x} ends before etext {etext:#x}"
+            );
+            let holder = bin
+                .text_sections()
+                .into_iter()
+                .find(|s| s.baseaddr + (s.end - s.vaddr) == end)
+                .unwrap();
+            assert!(
+                holder.baseaddr < etext,
+                "{path}: section starts before etext"
+            );
+        }
+    }
+
+    /// The executable section header is the oracle: an internally linked
+    /// image's Go section is the whole of it, a host-linked one's stops short
+    /// of the C code the host linker put after Go's.
+    #[test]
+    fn text_section_end_is_where_the_go_linker_ended_its_section() {
+        for (path, end, header_end) in [
+            // Internally linked: the Go section is the ELF `.text`.
+            (BASIC_GO127_LINUX, 0x49d411, 0x49d411),
+            ("tests/samples/basic_go120_linux_amd64", 0x4852d1, 0x4852d1),
+            // Host-linked: `.text` runs on into C code.
+            ("tests/samples/cgo_go127_linux_amd64", 0x49d271, 0x49dd48),
+            ("tests/samples/cgo_go116_linux_amd64", 0x49a1ea, 0x49acdf),
+            (
+                "tests/samples/plugin_go126_darwin_arm64.so",
+                0xea3e4,
+                0xeaa94,
+            ),
+        ] {
+            let data = load(path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let text = bin.context().sections().text_section.unwrap();
+            assert_eq!(text.va + text.size as u64, header_end, "{path}: header");
+            assert_eq!(bin.text_section_end_va(), Some(end), "{path}");
+        }
+        // No `textsectmap` before Go 1.8.
+        let data = load("tests/samples/basic_go17_linux_amd64");
+        assert_eq!(GoBinary::parse(&data).unwrap().text_section_end_va(), None);
+    }
+
+    /// The symbol names gobin states are the ones an unstripped ELF's symbol
+    /// table gives the text bounds.
+    #[test]
+    fn text_symbols_name_the_text_bounds() {
+        for path in [
+            BASIC_GO127_LINUX,
+            "tests/samples/cgo_go127_linux_amd64",
+            "tests/samples/basic_go116_linux_amd64",
+            "tests/samples/basic_go110_linux_amd64",
+        ] {
+            let data = load(path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let elf = goblin::elf::Elf::parse(&data).unwrap();
+            let symbol = |name: &str| {
+                elf.syms
+                    .iter()
+                    .find(|sym| elf.strtab.get_at(sym.st_name) == Some(name))
+                    .map(|sym| sym.st_value)
+            };
+            assert_eq!(symbol(TEXT_SYMBOL), bin.text_va(), "{path}: {TEXT_SYMBOL}");
+            assert_eq!(
+                symbol(ETEXT_SYMBOL),
+                bin.etext_va(),
+                "{path}: {ETEXT_SYMBOL}"
+            );
         }
     }
 
