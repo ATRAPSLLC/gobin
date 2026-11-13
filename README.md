@@ -29,7 +29,7 @@ if let Some(bin) = GoBinary::parse(&data) {
 - **Build ID** extraction (ELF note + raw text-segment marker)
 - **Build info** blob: Go version, module path, dependencies, build settings (GOOS, GOARCH, VCS info)
 - **pclntab** (PC/line table): function names, source file paths, line numbers, entry offsets
-- **Type descriptors**: `abi.Type` structs via `.typelink` section or moduledata walking, with resolved parameter/field type names
+- **Type descriptors**: `abi.Type` structs via `.typelink` section or moduledata walking, with resolved parameter/field type names, plus a scan of the type region for descriptors only code reaches (closure contexts)
 - **Interface tables** (itabs): every `(interface, concrete type)` pair the linker proved
 - **`//go:embed` assets**: embedded file paths and bytes (works stripped, all formats)
 - **Package init order** from `moduledata.inittasks`

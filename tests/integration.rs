@@ -3339,3 +3339,53 @@ mod harness {
         }
     }
 }
+
+// ===========================================================================
+// Types only code reaches: the descriptors laid out in the type region.
+// ===========================================================================
+mod laid_out_types {
+    use super::*;
+
+    /// **Every descriptor the reflection tables name is one the type region
+    /// scan finds**, on every sample that has them: the scan's checks reject
+    /// no real descriptor. And the scan reaches types the tables do not name
+    /// (a closure's context), so `all_types` holds more than `types` alone
+    /// would reach on some sample.
+    #[test]
+    fn the_scan_finds_every_reflected_descriptor_and_more() {
+        let mut beyond = 0usize;
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir("tests/samples").unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.to_string_lossy().to_string();
+            if name.ends_with(".sh") || !path.is_file() {
+                continue;
+            }
+            let data = load(&name);
+            let Some(bin) = GoBinary::parse(&data) else {
+                continue;
+            };
+            let reflected: BTreeSet<u64> = bin.types().map(|t| t.descriptor_va).collect();
+            if reflected.is_empty() {
+                continue;
+            }
+            checked += 1;
+            let laid_out: BTreeSet<u64> = bin
+                .laid_out_types()
+                .iter()
+                .map(|t| t.descriptor_va)
+                .collect();
+            let missed: Vec<u64> = reflected.difference(&laid_out).copied().take(5).collect();
+            assert!(
+                missed.is_empty(),
+                "{name}: reflected descriptors the scan missed: {missed:#x?}"
+            );
+            beyond += laid_out.difference(&reflected).count();
+        }
+        assert!(checked > 0, "no sample with reflected types");
+        assert!(
+            beyond > 0,
+            "the scan reaches no type the tables do not name"
+        );
+    }
+}

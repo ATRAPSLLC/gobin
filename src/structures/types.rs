@@ -31,7 +31,10 @@
 //!   `sym.STYPE` case) - which also records `typedesclen` and `itaboffset`
 //! - Moduledata: `src/runtime/symtab.go`
 
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    ops::Range,
+};
 
 use crate::{
     formats::BinaryContext,
@@ -872,6 +875,93 @@ pub fn type_at_va<'a>(
         return None;
     }
     Some(t)
+}
+
+impl GoType<'_> {
+    /// Whether this type, parsed where no reference pointed, holds every field
+    /// the ABI fixes as a descriptor's own: a power-of-two alignment and field
+    /// alignment no larger than it, pointer bytes within the size, only the
+    /// defined `TFlag` bits, a size and pointer extent its kind fixes for the
+    /// kinds that fix one, an equality field naming the image or nothing
+    /// (`mapped` says whether an address lies in the image: the field holds a
+    /// closure since Go 1.14 and the type's algorithm table before), and a
+    /// pointer-to-this inside the type region or none. `ps` is the pointer
+    /// size, `region` the module's type range.
+    fn holds_as_descriptor(
+        &self,
+        ps: u64,
+        mapped: impl Fn(u64) -> bool,
+        region: &Range<u64>,
+        types_base: u64,
+    ) -> bool {
+        let aligned = |align: u8| matches!(align, 1 | 2 | 4 | 8 | 16);
+        let fixed = match self.kind {
+            TypeKind::Bool | TypeKind::Int8 | TypeKind::Uint8 => Some((1, 0)),
+            TypeKind::Int16 | TypeKind::Uint16 => Some((2, 0)),
+            TypeKind::Int32 | TypeKind::Uint32 | TypeKind::Float32 => Some((4, 0)),
+            TypeKind::Int64 | TypeKind::Uint64 | TypeKind::Float64 | TypeKind::Complex64 => {
+                Some((8, 0))
+            }
+            TypeKind::Complex128 => Some((16, 0)),
+            TypeKind::Int | TypeKind::Uint | TypeKind::Uintptr => Some((ps, 0)),
+            TypeKind::Pointer
+            | TypeKind::UnsafePointer
+            | TypeKind::Map
+            | TypeKind::Chan
+            | TypeKind::Func => Some((ps, ps)),
+            TypeKind::String => Some((ps.saturating_mul(2), ps)),
+            TypeKind::Slice => Some((ps.saturating_mul(3), ps)),
+            TypeKind::Interface => Some((ps.saturating_mul(2), ps.saturating_mul(2))),
+            TypeKind::Array | TypeKind::Struct => None,
+            TypeKind::Invalid => return false,
+        };
+        let pointer_to_this = self.ptr_to_this == 0
+            || u64::try_from(self.ptr_to_this)
+                .ok()
+                .and_then(|offset| types_base.checked_add(offset))
+                .is_some_and(|va| region.contains(&va));
+        aligned(self.align)
+            && aligned(self.field_align)
+            && self.field_align <= self.align
+            && self.ptr_bytes <= self.size
+            && self.tflag & !0x3f == 0
+            && !self.name.is_empty()
+            && fixed
+                .is_none_or(|(size, ptr_bytes)| self.size == size && self.ptr_bytes <= ptr_bytes)
+            && (self.equal_va == 0 || mapped(self.equal_va))
+            && pointer_to_this
+    }
+}
+
+/// Every type descriptor laid out in the type region `[types_base, etypes)`
+/// at a pointer-aligned address that holds as one (every field the ABI fixes
+/// is consistent: alignment, pointer bytes, `TFlag` bits, the size its kind
+/// fixes, the equality function and the pointer-to-this): the descriptors no
+/// reference the reflection tables hold reaches, such as a closure's context
+/// struct and its pointer, which only code allocates.
+pub fn scan_descriptors<'a>(
+    ctx: &'a BinaryContext<'a>,
+    types_base: u64,
+    etypes: u64,
+    abi: TypeAbi,
+) -> Vec<GoType<'a>> {
+    let ps = u64::from(abi.ps);
+    if ps == 0 || etypes <= types_base {
+        return Vec::new();
+    }
+    let region = types_base..etypes;
+    let mapped = |va: u64| ctx.va_to_file(va).is_some();
+    let mut out = Vec::new();
+    let mut va = types_base;
+    while va < etypes {
+        if let Some(t) = type_at_va(ctx, va, types_base, abi)
+            .filter(|t| t.holds_as_descriptor(ps, mapped, &region, types_base))
+        {
+            out.push(t);
+        }
+        va = va.saturating_add(ps);
+    }
+    out
 }
 
 /// Transitively enumerate every type reachable from `seeds`.

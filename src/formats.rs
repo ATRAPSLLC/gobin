@@ -568,6 +568,33 @@ impl<'a> BinaryContext<'a> {
         None
     }
 
+    /// The file ranges the loaded image maps to an address, in order and
+    /// merged: [`Self::file_to_va`] answers for an offset inside one and for
+    /// no other. Empty when the binary states no mapping.
+    pub fn mapped_file_ranges(&self) -> Vec<(usize, usize)> {
+        let len = self.data.len();
+        let mut ranges: Vec<(usize, usize)> = self
+            .segments
+            .iter()
+            .filter_map(|&(_, seg_off, seg_size)| {
+                let start = usize::try_from(seg_off).ok()?.min(len);
+                let end = usize::try_from(seg_off.checked_add(seg_size)?)
+                    .ok()?
+                    .min(len);
+                (start < end).then_some((start, end))
+            })
+            .collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
     /// Translate a file byte offset to a virtual address.
     pub fn file_to_va(&self, file_off: usize) -> Option<u64> {
         let file_off = file_off as u64;
