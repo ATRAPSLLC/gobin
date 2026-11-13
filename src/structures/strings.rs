@@ -19,6 +19,12 @@
 //! - Bounding `len` to `[MIN_LEN, MAX_LEN]` (default 2..=4096).
 //! - Excluding pointers that fall inside `[moduledata.text, moduledata.etext)`
 //!   (string data never lives in the code segment).
+//! - Reading headers only in the program's data: after the code, outside the
+//!   pclntab, at positions the image maps to an address. A string header is a
+//!   value the program holds; the container's own tables are not, and an ELF
+//!   symbol's `(st_value, st_size)` or a program header's
+//!   `(p_vaddr, p_filesz)` reads exactly like `(ptr, len)`: they framed the
+//!   byte tables symbols describe and the build-ID note as strings.
 //!
 //! UTF-8 is **not** required: malware regularly stashes non-UTF-8 payloads
 //! (encoded shellcode, blobs, encrypted strings) in rodata as Go-style
@@ -31,7 +37,7 @@
 //! can `.collect::<HashSet<_>>()`.
 
 use crate::{
-    formats::BinaryContext,
+    formats::{BinaryContext, BinaryFormat},
     structures::{moduledata::Moduledata, util::read_uintptr},
 };
 
@@ -98,6 +104,12 @@ pub struct GoStringIter<'a> {
     /// data never lives in code).
     text_start: u64,
     text_end: u64,
+    /// The view ranges a header may sit in, in order: the program's data. A
+    /// Go string header is a value the program holds, so it lies in the data
+    /// the linker places after the code, never in the container's own tables
+    /// (an ELF symbol's value and size, a program header's address and file
+    /// size read as a pointer and a length), the code, or the pclntab.
+    regions: Vec<(usize, usize)>,
 }
 
 impl<'a> GoStringIter<'a> {
@@ -108,7 +120,24 @@ impl<'a> GoStringIter<'a> {
             ps: 0,
             text_start: 0,
             text_end: 0,
+            regions: Vec::new(),
         }
+    }
+
+    /// Moves `pos` into the first region that holds a whole header at or
+    /// after it; `false` when none is left.
+    fn enter_region(&mut self, header: usize) -> bool {
+        while let Some(&(start, end)) = self.regions.first() {
+            if self.pos < start {
+                // Keep pointer alignment: a header is at a multiple of `ps`.
+                self.pos = start.div_ceil(self.ps).saturating_mul(self.ps);
+            }
+            if self.pos.saturating_add(header) <= end {
+                return true;
+            }
+            self.regions.remove(0);
+        }
+        false
     }
 }
 
@@ -125,9 +154,13 @@ impl<'a> Iterator for GoStringIter<'a> {
         // reconstructed linear-memory image, otherwise the file bytes.
         let data = self.ctx.structure_search_data();
 
+        let header = ps.checked_mul(2)?;
         loop {
-            // Need ps + ps bytes for the (ptr, len) header.
-            let header_end = self.pos.checked_add(ps.checked_mul(2)?)?;
+            // Need ps + ps bytes for the (ptr, len) header, inside the data.
+            if !self.enter_region(header) {
+                return None;
+            }
+            let header_end = self.pos.checked_add(header)?;
             if header_end > data.len() {
                 return None;
             }
@@ -185,18 +218,72 @@ pub fn extract_iter<'a>(
         // cut most noise.
         None => (0, 0),
     };
+    // The program's data: every search region after the code that the image
+    // maps to an address (a symbol table or a debug section is file content
+    // no address holds). A binary that states no mapping keeps the regions
+    // after the code. The wasm view is linear memory, all of it data.
+    let regions = if ctx.format() == BinaryFormat::Wasm {
+        ctx.search_regions()
+    } else {
+        let code_end = ctx
+            .sections()
+            .text_section
+            .map_or(0, |text| text.offset.saturating_add(text.size));
+        let after_code = ctx.search_regions().into_iter().filter_map(|(start, end)| {
+            let start = start.max(code_end);
+            (start < end).then_some((start, end))
+        });
+        let mapped = ctx.mapped_file_ranges();
+        if mapped.is_empty() {
+            after_code.collect()
+        } else {
+            intersect(after_code, &mapped)
+        }
+    };
     GoStringIter {
         ctx,
         pos: 0,
         ps,
         text_start,
         text_end,
+        regions,
     }
+}
+
+/// The parts of `regions` that lie inside `within`, in order. Both are sorted
+/// and `within` is non-overlapping.
+fn intersect(
+    regions: impl Iterator<Item = (usize, usize)>,
+    within: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (start, end) in regions {
+        for &(from, to) in within {
+            let (lo, hi) = (start.max(from), end.min(to));
+            if lo < hi {
+                out.push((lo, hi));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region keeps only its mapped parts: a symbol table after the last
+    /// segment and a gap between two segments are dropped, a region spanning
+    /// two segments splits in two.
+    #[test]
+    fn regions_keep_their_mapped_parts() {
+        let mapped = [(0x1000, 0x3000), (0x4000, 0x6000)];
+        let regions = [(0x0800, 0x1800), (0x2800, 0x4800), (0x7000, 0x8000)];
+        assert_eq!(
+            intersect(regions.into_iter(), &mapped),
+            vec![(0x1000, 0x1800), (0x2800, 0x3000), (0x4000, 0x4800)]
+        );
+    }
 
     #[test]
     fn min_max_len_constants() {

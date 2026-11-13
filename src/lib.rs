@@ -749,11 +749,37 @@ impl<'a> GoBinary<'a> {
         })
     }
 
-    /// Whether this binary uses the pre-1.17 (`Go116`) type-name encoding.
-    fn legacy_names(&self) -> bool {
-        self.pclntab_meta
-            .map(|m| matches!(m.version, PclntabVersion::Go116 | PclntabVersion::Go12))
-            .unwrap_or(false)
+    /// Whether this binary writes a type name's length as a big-endian
+    /// `uint16` (Go 1.16 and before) rather than a varint (Go 1.17 on).
+    ///
+    /// Go 1.16 and 1.17 share one pclntab version, so that alone cannot tell
+    /// them apart: the toolchain version decides where the binary states it,
+    /// and otherwise the first reflected type's name, which only its own
+    /// encoding reads as a clean name (the other reads the varint's byte as a
+    /// zero length, or a big-endian length that runs into the next names).
+    pub fn legacy_names(&self) -> bool {
+        let Some(meta) = self.pclntab_meta else {
+            return false;
+        };
+        match meta.version {
+            PclntabVersion::Go12 => true,
+            PclntabVersion::Go116 => match self.go_version().and_then(parse_go_minor_version) {
+                Some(minor) => minor < 17,
+                None => self.reads_legacy_names(meta),
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether the first reflected type's name reads cleanly in the legacy
+    /// encoding ([`Self::legacy_names`]); `true` when no type is reflected.
+    fn reads_legacy_names(&self, meta: PclntabMeta) -> bool {
+        let Some(module) = self.moduledata.as_ref() else {
+            return true;
+        };
+        types::extract_types_iter(&self.ctx, module, self.type_abi_with(meta, true))
+            .next()
+            .is_none_or(|t| !t.name.is_empty() && !t.name.bytes().any(|b| b < 0x20))
     }
 
     /// Resolve a `NameOff` (relative to `moduledata.types`) to a name string.
@@ -1137,7 +1163,10 @@ impl<'a> GoBinary<'a> {
     /// Enumerate **every** reachable type descriptor, not just the
     /// reflection-registered `typelink` set returned by [`Self::types`].
     ///
-    /// Seeds from `typelink` and transitively follows every referenced type
+    /// Seeds from `typelink` and from every descriptor laid out in the type
+    /// region that holds as one ([`types::scan_descriptors`]: the types only
+    /// code allocates, such as a closure's context), and transitively follows
+    /// every referenced type
     /// (pointer/slice/array/chan elements, map key/value, struct field types,
     /// func parameter/result types, method signatures, and each type's
     /// pointer-to-this), parsing each descriptor independently by virtual
@@ -1153,13 +1182,22 @@ impl<'a> GoBinary<'a> {
             Some(m) => (m.types, m.etypes),
             None => return Vec::new(),
         };
-        types::extract_all_types(
-            &self.ctx,
-            self.types().collect(),
-            types_base,
-            etypes,
-            self.type_abi(meta),
-        )
+        // The reflection tables reach the types a program can name; the type
+        // region also holds those only code allocates (a closure's context),
+        // found where a laid-out descriptor holds as one.
+        let mut seeds: Vec<types::GoType<'_>> = self.types().collect();
+        seeds.extend(self.laid_out_types());
+        types::extract_all_types(&self.ctx, seeds, types_base, etypes, self.type_abi(meta))
+    }
+
+    /// Every type descriptor laid out in the module's type region that holds
+    /// as one ([`types::scan_descriptors`]): the reflection tables' types and
+    /// the ones only code reaches. Empty without moduledata.
+    pub fn laid_out_types(&self) -> Vec<types::GoType<'_>> {
+        let (Some(meta), Some(module)) = (self.pclntab_meta, self.moduledata.as_ref()) else {
+            return Vec::new();
+        };
+        types::scan_descriptors(&self.ctx, module.types, module.etypes, self.type_abi(meta))
     }
 
     /// The per-binary constants every type-descriptor read depends on.
@@ -1169,10 +1207,15 @@ impl<'a> GoBinary<'a> {
     /// feeds the position of every map type's `UncommonType`, so it has to be
     /// settled before any descriptor is read. See [`types::MapLayout::infer`].
     fn type_abi(&self, meta: PclntabMeta) -> types::TypeAbi {
+        self.type_abi_with(meta, self.legacy_names())
+    }
+
+    /// [`Self::type_abi`] with the name encoding `legacy_names` states.
+    fn type_abi_with(&self, meta: PclntabMeta, legacy_names: bool) -> types::TypeAbi {
         let md_version = self.moduledata.as_ref().map(|m| m.version);
         types::TypeAbi {
             ps: meta.ptr_size,
-            legacy_names: self.legacy_names(),
+            legacy_names,
             map_layout: types::MapLayout::infer(
                 self.go_version().and_then(parse_go_minor_version),
                 meta.version == PclntabVersion::Go120,

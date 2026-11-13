@@ -5,6 +5,45 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1]
+
+Types only code reaches, a fix for Go 1.17 type names, and string scanning
+confined to the program's data.
+
+### Added
+
+- `GoBinary::laid_out_types`, every type descriptor laid out in the module's
+  type region that holds as one, found by `types::scan_descriptors`: the
+  reflection tables' types and those only code allocates, such as a
+  closure's context struct and its pointer. A candidate is kept only when
+  every field the ABI fixes holds (power-of-two alignment, pointer bytes
+  within the size, defined `TFlag` bits only, the size its kind fixes, an
+  equality function in the image, a pointer-to-this inside the type region).
+- `GoBinary::all_types` seeds from these as well as from `typelink`, so it
+  now reaches the types the reflection tables do not name.
+- `GoBinary::legacy_names` is public: whether type names carry a big-endian
+  `uint16` length (Go 1.16 and before) rather than a varint (Go 1.17 on).
+- `BinaryContext::mapped_file_ranges`, the merged file ranges the loaded
+  image maps to an address.
+
+### Fixed
+
+- Go 1.17 binaries read their type names in the Go 1.16 encoding. Both
+  versions share one pclntab version, which alone decided the encoding. The
+  toolchain version now decides where the binary states it, and otherwise
+  the first reflected type's name, which only its own encoding reads cleanly.
+- String extraction no longer reads Go string headers out of the container's
+  own tables. An ELF symbol's `(st_value, st_size)` and a program header's
+  `(p_vaddr, p_filesz)` read exactly like `(ptr, len)`, so symbol-table
+  bytes and the build-ID note came back as strings. Headers are now read only
+  in the program's data: after the code and at file positions the image
+  maps to an address (all of linear memory for wasm).
+
+### Changed
+
+- Refreshed transitive dependencies (`cargo update`); `goblin` 0.10.7 and
+  `divan` 0.1.21 are current.
+
 ## [0.6.0]
 
 The runtime's own statements of where its code and build ID sit, so consumers
@@ -760,6 +799,9 @@ Initial public release.
 - Type descriptor extraction via `.typelink` and descriptor walking.
 - Heuristic confidence scoring (`Confidence` enum).
 
+[0.6.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.0...v0.5.1
+[0.6.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.4.1...v0.5.0
