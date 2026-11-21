@@ -6,18 +6,26 @@
 //! is enumerated in the `itablinks` slice (or, on ELF, the `.itablink`
 //! section), which is an array of `*itab` pointers.
 //!
-//! ## `itab` Layout (Go 1.16+)
+//! ## `itab` Layout
+//!
+//! The record has had four shapes ([`ItabLayout`]); the current one, Go
+//! 1.23's `internal/abi.ITab`:
 //!
 //! ```text
 //! Offset  Size       Field    Description
 //! 0       ptrSize    inter    *interfacetype  (VA of interface type descriptor)
 //! ptrSize ptrSize    _type    *_type          (VA of concrete type descriptor)
 //! 2*ptr   4          hash     u32             (copy of _type.hash, for type assertion)
-//! 2*ptr+4 4          _pad     [4]byte         (reserved)
-//! 2*ptr+8 var        fun[N]   uintptr[]       (method func VAs; N inferred from interfacetype)
+//! 3*ptr   var        fun[N]   uintptr[]       (method func VAs; N inferred from interfacetype)
 //! ```
 //!
-//! Source: `src/runtime/runtime2.go:982-991`
+//! Go 1.10-1.22 put an explicit `_ [4]byte` after `hash`, which moves `fun`
+//! to `2*ptr+8`: the same offset on 64-bit, one word later on 32-bit. Go
+//! 1.7-1.9 had a `link *itab` word after `_type` and two more 32-bit fields
+//! (`hash` only from 1.9), putting `fun` at `3*ptr+8`.
+//!
+//! Source: `src/internal/abi/iface.go` (`ITab`, Go 1.23+) and
+//! `src/runtime/runtime2.go` (`itab`, before).
 //!
 //! ## Why It Matters
 //!
@@ -27,11 +35,26 @@
 
 use crate::{
     formats::BinaryContext,
-    structures::{
-        abitype::AbiType, interfacetype::InterfaceTypeExtra, moduledata::Moduledata,
-        util::read_uintptr,
-    },
+    metadata::FunctionInfo,
+    structures::{abitype::AbiType, interfacetype::InterfaceTypeExtra, moduledata::Moduledata},
+    util::read_uintptr,
 };
+
+/// One method of an itab: an interface method and the concrete method it is
+/// bound to ([`crate::GoBinary::itab_methods`]).
+#[derive(Debug, Clone)]
+pub struct ItabMethod<'a> {
+    /// The interface method's name; `None` when the interface type
+    /// descriptor does not list it.
+    pub name: Option<&'a str>,
+    /// The itab's `Fun` word for the method: the bound method's code
+    /// address, `0` when unbound (Go 1.5-1.9 link every itab unbound, for the
+    /// runtime to fill at init).
+    pub va: u64,
+    /// The function whose entry is [`Self::va`]: the concrete type's method,
+    /// or the wrapper that adapts it to the interface call.
+    pub function: Option<FunctionInfo<'a>>,
+}
 
 /// One `(interface, concrete type)` pair recorded by the linker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +69,56 @@ pub struct ItabPair {
     pub itab_va: u64,
 }
 
+/// Where an `itab`'s `hash` and `fun` fields sit, which Go changed three
+/// times. Measured against binaries from each toolchain, as well as read from
+/// the struct definitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItabLayout {
+    /// Go 1.5-1.8: `inter, _type, link *itab, bad int32, unused int32, fun`.
+    /// No `hash`; the linker leaves `fun` empty for the runtime to fill at
+    /// init (`additab`).
+    Linked,
+    /// Go 1.9: `inter, _type, link *itab, hash uint32, bad bool, inhash bool,
+    /// unused [2]byte, fun`.
+    LinkedHash,
+    /// Go 1.10-1.22: `inter, _type, hash uint32, _ [4]byte, fun`.
+    Padded,
+    /// Go 1.23+ (`internal/abi.ITab`): `Inter, Type, Hash uint32, Fun`, with
+    /// `Fun` at the next pointer-aligned offset.
+    Abi,
+}
+
+impl ItabLayout {
+    /// The layout a Go minor version emits.
+    pub fn for_go_minor(minor: u32) -> Self {
+        match minor {
+            0..=8 => Self::Linked,
+            9 => Self::LinkedHash,
+            10..=22 => Self::Padded,
+            _ => Self::Abi,
+        }
+    }
+
+    /// Offset of `hash`, or `None` where the record has none (Go 1.5-1.8).
+    pub fn hash_offset(self, ps: usize) -> Option<usize> {
+        match self {
+            Self::Linked => None,
+            Self::LinkedHash => ps.checked_mul(3),
+            Self::Padded | Self::Abi => ps.checked_mul(2),
+        }
+    }
+
+    /// Offset of `fun[0]`, the first method word.
+    pub fn fun_offset(self, ps: usize) -> Option<usize> {
+        match self {
+            Self::Linked | Self::LinkedHash => ps.checked_mul(3)?.checked_add(8),
+            Self::Padded => ps.checked_mul(2)?.checked_add(8),
+            // `Hash` is 4 bytes; `Fun` aligns to the pointer after it.
+            Self::Abi => ps.checked_mul(3),
+        }
+    }
+}
+
 /// Streaming iterator over [`ItabPair`]s in a binary.
 ///
 /// Each [`Iterator::next`] reads one pointer from the underlying itab-array
@@ -55,6 +128,7 @@ pub struct ItabPair {
 pub struct ItabIter<'a> {
     ctx: &'a BinaryContext<'a>,
     ps: usize,
+    layout: ItabLayout,
     source: ItabSource<'a>,
 }
 
@@ -78,6 +152,7 @@ impl<'a> ItabIter<'a> {
         Self {
             ctx,
             ps: 0,
+            layout: ItabLayout::Abi,
             source: ItabSource::Empty,
         }
     }
@@ -115,7 +190,7 @@ impl Iterator for ItabIter<'_> {
                     Some(v) if v != 0 => v,
                     _ => continue,
                 };
-                if let Some(pair) = parse_itab(self.ctx, itab_va, ps, ps_u8) {
+                if let Some(pair) = parse_itab(self.ctx, itab_va, ps, ps_u8, self.layout) {
                     return Some(pair);
                 }
                 // parse failed; skip and try next entry
@@ -125,13 +200,13 @@ impl Iterator for ItabIter<'_> {
                     return None;
                 }
                 let cur = *va;
-                let pair = parse_itab(self.ctx, cur, ps, ps_u8)?;
+                let pair = parse_itab(self.ctx, cur, ps, ps_u8, self.layout)?;
                 // Advance by the record's true size. `itab.Size()` is
                 // sizeof(itab) (== 4*ptrSize) when `fun[0] == 0`, else
                 // 4*ptrSize + (nmethods-1)*ptrSize. Stop the walk if we
                 // cannot compute a strictly-positive stride - better to
                 // truncate than to misalign and emit garbage.
-                let stride = itab_stride(self.ctx, cur, ps, ps_u8)?;
+                let stride = itab_stride(self.ctx, cur, ps, ps_u8, self.layout)?;
                 let next = cur.checked_add(stride as u64)?;
                 if next <= cur {
                     return None;
@@ -150,10 +225,13 @@ impl Iterator for ItabIter<'_> {
 /// 2. `moduledata.itablinks` slice (PE / older Go ≤1.26).
 /// 3. Inline itab walk at `types+itaboffset` (Go 1.27+ / V5).
 /// 4. Empty iterator otherwise.
+///
+/// `layout` places the fields of each record (see [`ItabLayout`]).
 pub fn extract_iter<'a>(
     ctx: &'a BinaryContext<'a>,
     ptr_size: u8,
     moduledata: Option<&Moduledata>,
+    layout: ItabLayout,
 ) -> ItabIter<'a> {
     let ps = ptr_size as usize;
     if ps == 0 {
@@ -167,6 +245,7 @@ pub fn extract_iter<'a>(
         return ItabIter {
             ctx,
             ps,
+            layout,
             source: ItabSource::Pointers {
                 array: bytes,
                 pos: 0,
@@ -182,6 +261,7 @@ pub fn extract_iter<'a>(
         return ItabIter {
             ctx,
             ps,
+            layout,
             source: ItabSource::Pointers { array: s, pos: 0 },
         };
     }
@@ -196,6 +276,7 @@ pub fn extract_iter<'a>(
         return ItabIter {
             ctx,
             ps,
+            layout,
             source: ItabSource::Inline { va: start, end_va },
         };
     }
@@ -205,15 +286,19 @@ pub fn extract_iter<'a>(
 
 /// Size in bytes of the inline itab record at `itab_va` (Go 1.27+).
 ///
-/// Mirrors `internal/abi.ITab.Size()`: the fixed header is `4*ptrSize`
-/// (Inter, Type, Hash+pad, Fun[1]); when `Fun[0] != 0` the record carries
-/// one `uintptr` per interface method, so the total is
-/// `4*ptrSize + (nmethods-1)*ptrSize`.
-fn itab_stride(ctx: &BinaryContext<'_>, itab_va: u64, ps: usize, ps_u8: u8) -> Option<usize> {
-    let base = ps.checked_mul(4)?;
+/// Mirrors `internal/abi.ITab.Size()`: the fixed header runs through
+/// `Fun[0]`; when `Fun[0] != 0` the record carries one `uintptr` per
+/// interface method, so the total grows by `(nmethods-1)*ptrSize`.
+fn itab_stride(
+    ctx: &BinaryContext<'_>,
+    itab_va: u64,
+    ps: usize,
+    ps_u8: u8,
+    layout: ItabLayout,
+) -> Option<usize> {
+    let fun0_off = layout.fun_offset(ps)?;
+    let base = fun0_off.checked_add(ps)?;
     let buf = ctx.slice_at_va(itab_va)?;
-    // Fun[0] sits at offset 3*ptrSize (after Inter, Type, Hash+pad).
-    let fun0_off = ps.checked_mul(3)?;
     let fun0 = read_uintptr(buf, fun0_off, ps_u8)?;
     if fun0 == 0 {
         return Some(base);
@@ -230,11 +315,17 @@ fn itab_stride(ctx: &BinaryContext<'_>, itab_va: u64, ps: usize, ps_u8: u8) -> O
 /// Resolve the `Fun[]` method-pointer array of an itab - the concrete-type
 /// implementations bound to each interface method, in interface-method order.
 ///
-/// `Fun` sits at `itab_va + 3*ptrSize` and has one `uintptr` per interface
+/// `Fun` sits where `layout` puts it and has one `uintptr` per interface
 /// method (count taken from the interface type descriptor). A `0` entry means
-/// the linker did not bind that method (the type does not fully implement the
-/// interface). Returns an empty vec if the count cannot be resolved.
-pub fn itab_methods(ctx: &BinaryContext<'_>, pair: &ItabPair, ptr_size: u8) -> Vec<u64> {
+/// the method is not bound: the type does not implement the interface, or (Go
+/// 1.5-1.9) the linker left the words for the runtime to fill at init.
+/// Returns an empty vec if the count cannot be resolved.
+pub fn itab_methods(
+    ctx: &BinaryContext<'_>,
+    pair: &ItabPair,
+    ptr_size: u8,
+    layout: ItabLayout,
+) -> Vec<u64> {
     let ps = ptr_size as usize;
     if ps == 0 {
         return Vec::new();
@@ -243,9 +334,9 @@ pub fn itab_methods(ctx: &BinaryContext<'_>, pair: &ItabPair, ptr_size: u8) -> V
         Some(n) if n > 0 && n < 100_000 => n,
         _ => return Vec::new(),
     };
-    let fun_off = match pair
-        .itab_va
-        .checked_add(ps.checked_mul(3).unwrap_or(0) as u64)
+    let fun_off = match layout
+        .fun_offset(ps)
+        .and_then(|off| pair.itab_va.checked_add(off as u64))
     {
         Some(v) => v,
         None => return Vec::new(),
@@ -277,22 +368,70 @@ fn interface_method_count(ctx: &BinaryContext<'_>, inter_va: u64, ps_u8: u8) -> 
 }
 
 /// Parse a single `itab` at `itab_va`.
-fn parse_itab(ctx: &BinaryContext<'_>, itab_va: u64, ps: usize, ps_u8: u8) -> Option<ItabPair> {
+///
+/// Where the record has no `hash` (Go 1.5-1.8) the pair carries the concrete
+/// type's, which is what the field copies from Go 1.9 on.
+fn parse_itab(
+    ctx: &BinaryContext<'_>,
+    itab_va: u64,
+    ps: usize,
+    ps_u8: u8,
+    layout: ItabLayout,
+) -> Option<ItabPair> {
     let buf = ctx.slice_at_va(itab_va)?;
-    let hash_off = ps.checked_mul(2)?;
-    let needed = hash_off.checked_add(4)?;
-    if buf.len() < needed {
-        return None;
-    }
     let iface_type_va = read_uintptr(buf, 0, ps_u8)?;
     let concrete_type_va = read_uintptr(buf, ps, ps_u8)?;
-    let hash_end = hash_off.checked_add(4)?;
-    let hash_bytes: [u8; 4] = buf.get(hash_off..hash_end)?.try_into().ok()?;
-    let hash = u32::from_le_bytes(hash_bytes);
+    let hash = match layout.hash_offset(ps) {
+        Some(hash_off) => {
+            let hash_end = hash_off.checked_add(4)?;
+            let hash_bytes: [u8; 4] = buf.get(hash_off..hash_end)?.try_into().ok()?;
+            u32::from_le_bytes(hash_bytes)
+        }
+        None => AbiType::parse(ctx.slice_at_va(concrete_type_va)?, ps_u8)?.hash,
+    };
     Some(ItabPair {
         iface_type_va,
         concrete_type_va,
         hash,
         itab_va,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layouts_follow_the_go_version() {
+        for (minor, layout) in [
+            (5, ItabLayout::Linked),
+            (8, ItabLayout::Linked),
+            (9, ItabLayout::LinkedHash),
+            (10, ItabLayout::Padded),
+            (22, ItabLayout::Padded),
+            (23, ItabLayout::Abi),
+            (28, ItabLayout::Abi),
+        ] {
+            assert_eq!(ItabLayout::for_go_minor(minor), layout, "go1.{minor}");
+        }
+    }
+
+    /// The offsets of each shape on both pointer sizes, from the struct
+    /// definitions and measured on `linux/amd64` and `linux/386` binaries.
+    #[test]
+    fn field_offsets_per_layout() {
+        for (layout, ps, hash, fun) in [
+            (ItabLayout::Linked, 8, None, 32),
+            (ItabLayout::LinkedHash, 8, Some(24), 32),
+            (ItabLayout::Padded, 8, Some(16), 24),
+            (ItabLayout::Abi, 8, Some(16), 24),
+            (ItabLayout::Linked, 4, None, 20),
+            (ItabLayout::LinkedHash, 4, Some(12), 20),
+            (ItabLayout::Padded, 4, Some(8), 16),
+            (ItabLayout::Abi, 4, Some(8), 12),
+        ] {
+            assert_eq!(layout.hash_offset(ps), hash, "{layout:?} ps={ps}");
+            assert_eq!(layout.fun_offset(ps), Some(fun), "{layout:?} ps={ps}");
+        }
+    }
 }

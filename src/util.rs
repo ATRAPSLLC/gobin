@@ -11,6 +11,8 @@
 //!   arithmetic.
 //! - **Variable-length integer decoder** ([`read_uvarint`]) for the Go
 //!   pclntab and buildinfo formats which both use LEB128.
+//! - **Byte search** ([`find_bytes`]) for the markers and magics the parsers
+//!   scan for.
 //!
 //! All arithmetic uses `checked_*` / `saturating_*` so the
 //! `clippy::arithmetic_side_effects` lint stays clean and parsers cannot
@@ -18,14 +20,14 @@
 
 /// Read a fixed-width slice at `offset`, returning `None` if out of bounds or
 /// if `offset + N` overflows.
-pub(crate) fn slice_at<const N: usize>(data: &[u8], offset: usize) -> Option<[u8; N]> {
+pub fn slice_at<const N: usize>(data: &[u8], offset: usize) -> Option<[u8; N]> {
     let end = offset.checked_add(N)?;
     let s = data.get(offset..end)?;
     s.try_into().ok()
 }
 
 /// Read a little-endian `uintptr` (4 or 8 bytes depending on `ps`).
-pub(crate) fn read_uintptr(data: &[u8], offset: usize, ps: u8) -> Option<u64> {
+pub fn read_uintptr(data: &[u8], offset: usize, ps: u8) -> Option<u64> {
     match ps {
         4 => Some(u32::from_le_bytes(slice_at::<4>(data, offset)?) as u64),
         8 => Some(u64::from_le_bytes(slice_at::<8>(data, offset)?)),
@@ -34,17 +36,17 @@ pub(crate) fn read_uintptr(data: &[u8], offset: usize, ps: u8) -> Option<u64> {
 }
 
 /// Read a little-endian `u32`.
-pub(crate) fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+pub fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(slice_at::<4>(data, offset)?))
 }
 
 /// Read a little-endian `i32`.
-pub(crate) fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
+pub fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
     Some(i32::from_le_bytes(slice_at::<4>(data, offset)?))
 }
 
 /// Read a little-endian `u16`.
-pub(crate) fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+pub fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(slice_at::<2>(data, offset)?))
 }
 
@@ -54,7 +56,7 @@ pub(crate) fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
 /// like [`crate::structures::moduledata::Moduledata::parse`] that walk
 /// fixed-layout records field by field.
 #[inline]
-pub(crate) fn advance(off: usize, by: usize) -> Option<usize> {
+pub fn advance(off: usize, by: usize) -> Option<usize> {
     off.checked_add(by)
 }
 
@@ -63,7 +65,7 @@ pub(crate) fn advance(off: usize, by: usize) -> Option<usize> {
 /// Used to skip past `[uintptr; N]`-style padding regions in structures whose
 /// layout depends on pointer size.
 #[inline]
-pub(crate) fn advance_n(off: usize, n_units: usize, unit: usize) -> Option<usize> {
+pub fn advance_n(off: usize, n_units: usize, unit: usize) -> Option<usize> {
     n_units.checked_mul(unit).and_then(|t| off.checked_add(t))
 }
 
@@ -74,7 +76,7 @@ pub(crate) fn advance_n(off: usize, n_units: usize, unit: usize) -> Option<usize
 /// alignments, but expressed via `checked_*` so the lint stays satisfied and
 /// hostile inputs cannot wrap.
 #[inline]
-pub(crate) fn align_up(value: usize, align: usize) -> Option<usize> {
+pub fn align_up(value: usize, align: usize) -> Option<usize> {
     if align == 0 {
         return None;
     }
@@ -85,7 +87,7 @@ pub(crate) fn align_up(value: usize, align: usize) -> Option<usize> {
 
 /// `align_up` for `u64`, used when working with virtual addresses.
 #[inline]
-pub(crate) fn align_up_u64(value: u64, align: u64) -> Option<u64> {
+pub fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     if align == 0 {
         return None;
     }
@@ -104,7 +106,7 @@ pub(crate) fn align_up_u64(value: u64, align: u64) -> Option<u64> {
 /// pcdata encoder, and the buildinfo blob.
 ///
 /// Source: `src/encoding/binary/varint.go:63-82`.
-pub(crate) fn read_uvarint(data: &[u8]) -> Option<(u64, usize)> {
+pub fn read_uvarint(data: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     for (i, &byte) in data.iter().enumerate() {
@@ -119,6 +121,67 @@ pub(crate) fn read_uvarint(data: &[u8]) -> Option<(u64, usize)> {
         shift = shift.checked_add(7)?;
     }
     None
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+///
+/// Uses a simple sliding-window scan. For the sizes we deal with (binaries up to
+/// ~100MB, needles of 10-40 bytes), this is fast enough and avoids pulling in a
+/// heavier substring search dependency.
+pub fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (first, rest) = needle.split_first()?;
+    // Anchor on the first byte, then compare the tail only at candidates.
+    // `windows(n).position` compares every candidate window in full, which is
+    // the dominant cost of the whole-image searches PE and wasm binaries force
+    // when there is no section to narrow them to.
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    let mut from = 0usize;
+    while from <= last_start {
+        let window = haystack.get(from..)?;
+        let hit = find_byte(window, *first)?;
+        let start = from.checked_add(hit)?;
+        if start > last_start {
+            return None;
+        }
+        let tail_start = start.checked_add(1)?;
+        let tail_end = tail_start.checked_add(rest.len())?;
+        if haystack.get(tail_start..tail_end) == Some(rest) {
+            return Some(start);
+        }
+        from = tail_start;
+    }
+    None
+}
+
+/// Index of the first occurrence of `byte` in `haystack`.
+///
+/// Eight bytes are tested per iteration with the classic SWAR zero-byte trick:
+/// XOR-ing the word against a broadcast of the target turns "contains `byte`"
+/// into "contains a zero byte", which `(x - 0x01..01) & !x & 0x80..80` answers
+/// in three instructions. A byte-at-a-time `position` is roughly an order of
+/// magnitude slower over the megabyte-scale buffers this crate searches, and
+/// pulling in a `memchr` dependency for it is not worth the supply-chain
+/// surface on a crate that otherwise depends only on `goblin`.
+fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
+    const LANES: usize = 8;
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+
+    let broadcast = u64::from_ne_bytes([byte; LANES]);
+    let (words, tail) = haystack.as_chunks::<LANES>();
+    for (i, chunk) in words.iter().enumerate() {
+        let x = u64::from_ne_bytes(*chunk) ^ broadcast;
+        if x.wrapping_sub(LOW) & !x & HIGH == 0 {
+            continue;
+        }
+        let base = i.checked_mul(LANES)?;
+        let hit = chunk.iter().position(|&b| b == byte)?;
+        return base.checked_add(hit);
+    }
+    let consumed = haystack.len().checked_sub(tail.len())?;
+    tail.iter()
+        .position(|&b| b == byte)
+        .and_then(|hit| consumed.checked_add(hit))
 }
 
 #[cfg(test)]

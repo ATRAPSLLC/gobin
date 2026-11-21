@@ -49,3 +49,6 @@ divan = "0.1.21"
 [[bench]]
 name = "extract"
 harness = false
+
+[profile.test]
+opt-level = 1

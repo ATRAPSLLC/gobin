@@ -13,7 +13,7 @@
 //!
 //! Source: `src/internal/abi/type.go:340-345`
 
-use crate::structures::util::read_uintptr;
+use crate::util::read_uintptr;
 
 /// Parsed extra fields for an array type descriptor.
 #[derive(Debug, Clone, Copy, Default)]

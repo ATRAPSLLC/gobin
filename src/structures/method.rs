@@ -14,7 +14,7 @@
 //!
 //! Source: `src/internal/abi/type.go:238-250`
 
-use crate::structures::util::read_i32;
+use crate::util::read_i32;
 
 /// Parsed `abi.Method` -- a method on a concrete (non-interface) type.
 ///

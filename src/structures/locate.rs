@@ -32,6 +32,22 @@ pub struct LocatedModuledata {
     pub moduledata: Moduledata,
     /// Offset of its first byte in [`BinaryContext::structure_search_data`].
     pub offset: usize,
+    /// How the locator found it.
+    pub source: ModuledataSource,
+}
+
+/// How [`ModuledataLocator`] found a moduledata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuledataSource {
+    /// Its own section, `.go.module` / `__go_module` (Go 1.26+ ELF and
+    /// Mach-O).
+    Section,
+    /// A scan of the data sections the linker emits it into (`.noptrdata`,
+    /// PE's `.data`) for its pointer to the pclntab.
+    DataScan,
+    /// A scan of the whole image for that pointer, when the section table
+    /// names no data section or the scan there found none.
+    ImageScan,
 }
 
 /// Locates and parses a binary's `moduledata`.
@@ -91,6 +107,7 @@ impl<'a> ModuledataLocator<'a> {
         Some(LocatedModuledata {
             moduledata,
             offset: range.offset,
+            source: ModuledataSource::Section,
         })
     }
 
@@ -119,7 +136,10 @@ impl<'a> ModuledataLocator<'a> {
                 .flatten()
             {
                 if let Some(found) = self.scan_region(data, range.offset, range.size, target) {
-                    return Some(found);
+                    return Some(LocatedModuledata {
+                        source: ModuledataSource::DataScan,
+                        ..found
+                    });
                 }
             }
         }
@@ -174,6 +194,7 @@ impl<'a> ModuledataLocator<'a> {
                 return Some(LocatedModuledata {
                     moduledata,
                     offset: at,
+                    source: ModuledataSource::ImageScan,
                 });
             }
         }
@@ -183,15 +204,13 @@ impl<'a> ModuledataLocator<'a> {
     /// Whether a scanned candidate is a real moduledata.
     ///
     /// A pointer to the pclntab can appear outside the moduledata, so a hit is
-    /// only accepted when the fields around it also hold: the PC range must be
-    /// non-empty, and the structure must be anchored by a field that maps back
-    /// into the image. The legacy (Go 1.5-1.15) layout has no `funcnametab`
-    /// and - before Go 1.7 - no `types` base, so it is anchored through its
-    /// always-present `text` boundary instead.
+    /// only accepted when the fields around it also hold: the head must be
+    /// well formed (checked by [`Moduledata::parse`]), and the structure must
+    /// be anchored by a field that maps back into the image. The legacy (Go
+    /// 1.5-1.15) layout has no `funcnametab` and - before Go 1.7 - no `types`
+    /// base, so it is anchored through its always-present `text` boundary
+    /// instead.
     fn accept(&self, md: &Moduledata) -> bool {
-        if md.minpc >= md.maxpc {
-            return false;
-        }
         match md.version {
             ModuledataVersion::V1 => md.text != 0 && self.ctx.va_to_file(md.text).is_some(),
             _ => md.types != 0 && self.ctx.va_to_file(md.funcnametab.ptr).is_some(),

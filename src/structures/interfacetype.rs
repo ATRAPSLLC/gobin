@@ -12,7 +12,7 @@
 //!
 //! Source: `src/internal/abi/type.go:370-377`
 
-use crate::structures::{goslice::GoSlice, util::read_uintptr};
+use crate::{structures::goslice::GoSlice, util::read_uintptr};
 
 /// Parsed extra fields for an interface type descriptor.
 #[derive(Debug, Clone, Copy, Default)]

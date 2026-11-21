@@ -31,7 +31,10 @@ use gobin::{
     detection::{Confidence, ConfidenceSignal, ParseError},
     formats::BinaryFormat,
     metadata::{Compiler, FunctionInfo, FunctionIter, ObfuscationKind, for_each_function},
-    structures::{Arch, PclntabVersion},
+    structures::{
+        Arch, PclntabVersion,
+        pclntab::{FuncData, FuncId},
+    },
 };
 
 // Representative fixtures for the per-feature tests below. The full
@@ -171,7 +174,9 @@ mod detection {
             Ok(_) => panic!("random data must fail"),
             Err(e) => e,
         };
-        let ParseError::NotAGoBinary { report } = err;
+        let ParseError::NotAGoBinary { report } = err else {
+            panic!("random data is no universal Mach-O: {err:?}");
+        };
         assert_eq!(report.tier, Confidence::None);
     }
 
@@ -209,26 +214,36 @@ mod detection {
 mod functions {
     use super::*;
 
-    #[test]
-    fn function_info_short_name() {
-        let f = FunctionInfo {
-            name: "net/http.(*Client).Do",
-            entry_offset: 0,
-            args_size: 0,
-            start_line: 0,
-            func_id: 0,
-            flags: 0,
-            deferreturn: 0,
-            pcsp: 0,
-            pcfile: 0,
-            pcln: 0,
-            npcdata: 0,
-            cu_offset: 0,
-            nfuncdata: 0,
+    /// A normal function named `name`.
+    fn function(name: &str) -> FunctionInfo<'_> {
+        FunctionInfo {
+            name,
+            func: FuncData {
+                func_off: 0,
+                entry_off: 0,
+                name_off: 0,
+                args: 0,
+                deferreturn: 0,
+                pcsp: 0,
+                pcfile: 0,
+                pcln: 0,
+                npcdata: 0,
+                cu_offset: 0,
+                start_line: 0,
+                func_id: 0,
+                flag: 0,
+                nfuncdata: 0,
+            },
+            func_id: FuncId::Normal,
             source_file: None,
             end_line: 0,
             frame_size: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn function_info_short_name() {
+        let f = function("net/http.(*Client).Do");
         assert_eq!(f.short_name(), "(*Client).Do");
         assert_eq!(f.package(), Some("net/http"));
         assert!(f.is_method());
@@ -236,69 +251,47 @@ mod functions {
 
     #[test]
     fn function_info_closure() {
-        let f = FunctionInfo {
-            name: "main.main.func1",
-            entry_offset: 0,
-            args_size: 0,
-            start_line: 0,
-            func_id: 0,
-            flags: 0,
-            deferreturn: 0,
-            pcsp: 0,
-            pcfile: 0,
-            pcln: 0,
-            npcdata: 0,
-            cu_offset: 0,
-            nfuncdata: 0,
-            source_file: None,
-            end_line: 0,
-            frame_size: 0,
-        };
+        let f = function("main.main.func1");
         assert!(f.is_closure());
         assert!(!f.is_method());
     }
 
+    /// A funcID is read the way the compiler assigns it: the binary's
+    /// wrapper ID is a wrapper whatever the name (Go 1.17's ABI wrappers share
+    /// their function's name), and any other nonzero ID is the special the
+    /// name names, whatever its number (which Go renumbers between versions).
     #[test]
-    fn function_info_func_id_names() {
-        let f = FunctionInfo {
-            name: "runtime.goexit",
-            entry_offset: 0,
-            args_size: 0,
-            start_line: 0,
-            func_id: 86,
-            flags: 0,
-            deferreturn: 0,
-            pcsp: 0,
-            pcfile: 0,
-            pcln: 0,
-            npcdata: 0,
-            cu_offset: 0,
-            nfuncdata: 0,
-            source_file: None,
-            end_line: 0,
-            frame_size: 0,
-        };
-        assert_eq!(f.func_id_name(), Some("goexit"));
-
-        let normal = FunctionInfo {
-            name: "main.main",
-            entry_offset: 0,
-            args_size: 0,
-            start_line: 0,
-            func_id: 0,
-            flags: 0,
-            deferreturn: 0,
-            pcsp: 0,
-            pcfile: 0,
-            pcln: 0,
-            npcdata: 0,
-            cu_offset: 0,
-            nfuncdata: 0,
-            source_file: None,
-            end_line: 0,
-            frame_size: 0,
-        };
-        assert_eq!(normal.func_id_name(), None);
+    fn func_ids_classify_by_wrapper_id_then_name() {
+        let wrapper = Some(22);
+        assert_eq!(FuncId::classify(0, "main.main", wrapper), FuncId::Normal);
+        for raw in [7, 8, 14] {
+            assert_eq!(
+                FuncId::classify(raw, "runtime.goexit", wrapper),
+                FuncId::Goexit
+            );
+        }
+        assert_eq!(
+            FuncId::classify(22, "runtime.mstart", wrapper),
+            FuncId::Wrapper
+        );
+        assert_eq!(
+            FuncId::classify(14, "runtime.mstart", wrapper),
+            FuncId::Mstart
+        );
+        assert_eq!(
+            FuncId::classify(15, "runtime.cgocallback_gofunc", None),
+            FuncId::Cgocallback
+        );
+        assert_eq!(
+            FuncId::classify(22, "main.(*T).String", wrapper),
+            FuncId::Wrapper
+        );
+        // A nonzero, non-wrapper ID no name accounts for is reported as such.
+        assert_eq!(
+            FuncId::classify(5, "main.(*T).String", wrapper),
+            FuncId::Unknown(5)
+        );
+        assert_eq!(FuncId::RuntimeMain.as_str(), "runtime_main");
     }
 
     #[test]
@@ -327,12 +320,12 @@ mod functions {
             .iter()
             .find(|f| f.name == "main.main")
             .expect("main.main not found");
-        assert!(main_fn.start_line > 0, "start_line should be positive");
+        assert!(main_fn.func.start_line > 0, "start_line should be positive");
         assert!(
-            main_fn.end_line >= main_fn.start_line,
+            main_fn.end_line >= main_fn.func.start_line,
             "end_line ({}) should be >= start_line ({})",
             main_fn.end_line,
-            main_fn.start_line
+            main_fn.func.start_line
         );
     }
 
@@ -401,14 +394,6 @@ mod functions {
             .filter(|f| !f.is_runtime() && !f.is_internal())
             .count();
         assert!(user_fns > 0, "expected at least one user function");
-    }
-
-    #[test]
-    fn has_cgo_and_uses_concurrency_run_without_panic() {
-        let data = load(BASIC_NORMAL);
-        let bin = GoBinary::parse(&data).unwrap();
-        let _ = bin.has_cgo();
-        let _ = bin.uses_concurrency();
     }
 
     #[test]
@@ -552,17 +537,12 @@ mod strings_and_inline {
     fn inline_tree_yields_entries_for_typical_binary() {
         let data = load(BASIC_NORMAL);
         let bin = GoBinary::parse(&data).unwrap();
-        let pcl = bin.pclntab().unwrap();
 
         // Walk every function; expect at least one to expose inlined frames.
         let mut total_entries = 0usize;
         let mut saw_named = false;
         let mut max_depth = 0u32;
-        for (_, func_off) in pcl.func_entries() {
-            let func = match pcl.parse_func(func_off) {
-                Some(f) => f,
-                None => continue,
-            };
+        for func in bin.functions() {
             for entry in bin.inline_tree(&func) {
                 total_entries += 1;
                 if !entry.function_name.is_empty() {
@@ -592,16 +572,11 @@ mod strings_and_inline {
     fn inline_tree_empty_for_function_without_inlining() {
         let data = load(BASIC_NORMAL);
         let bin = GoBinary::parse(&data).unwrap();
-        let pcl = bin.pclntab().unwrap();
 
         // Find a function with no funcdata (typically asm helpers or trivial leaves)
         // and verify the iterator is empty rather than panicking.
-        for (_, func_off) in pcl.func_entries() {
-            let func = match pcl.parse_func(func_off) {
-                Some(f) => f,
-                None => continue,
-            };
-            if func.nfuncdata == 0 {
+        for func in bin.functions() {
+            if func.func.nfuncdata == 0 {
                 assert_eq!(
                     bin.inline_tree(&func).count(),
                     0,
@@ -642,7 +617,7 @@ mod addresses {
         let text_va = bin.text_va().unwrap();
         let funcs = bin.functions().collect::<Vec<_>>();
         let main_fn = funcs.iter().find(|f| f.name == "main.main").unwrap();
-        let main_va = text_va + main_fn.entry_offset as u64;
+        let main_va = text_va + main_fn.func.entry_off as u64;
         assert!(
             main_va > text_va,
             "main.main VA must be inside text segment"
@@ -655,11 +630,9 @@ mod addresses {
             let data = load(path);
             let bin = GoBinary::parse(&data).unwrap();
             let text_va = bin.text_va().unwrap();
-            let pcl = bin.pclntab().unwrap();
-            let (_, func_off) = pcl.func_entries().next().unwrap();
-            let func = pcl.parse_func(func_off).unwrap();
+            let func = bin.functions().next().unwrap();
 
-            let manual = text_va + func.entry_off as u64;
+            let manual = text_va + func.func.entry_off as u64;
             assert_eq!(
                 bin.entry_va(&func),
                 Some(manual),
@@ -673,9 +646,7 @@ mod addresses {
         // PE: entry_rva = entry_va − image_base.
         let data = load(BASIC_WINDOWS);
         let bin = GoBinary::parse(&data).unwrap();
-        let pcl = bin.pclntab().unwrap();
-        let (_, func_off) = pcl.func_entries().next().unwrap();
-        let func = pcl.parse_func(func_off).unwrap();
+        let func = bin.functions().next().unwrap();
 
         let image_base = bin.context().image_base();
         assert!(
@@ -699,9 +670,7 @@ mod addresses {
                 0,
                 "{path}: VA-native format should report image_base = 0"
             );
-            let pcl = bin.pclntab().unwrap();
-            let (_, func_off) = pcl.func_entries().next().unwrap();
-            let func = pcl.parse_func(func_off).unwrap();
+            let func = bin.functions().next().unwrap();
             assert_eq!(bin.entry_va(&func), bin.entry_rva(&func));
         }
     }
@@ -754,14 +723,14 @@ mod buildinfo {
             BuildMode::Plugin,
             BuildMode::Archive,
             BuildMode::Shared,
-            BuildMode::Other("custom-future".to_string()),
+            BuildMode::Other("custom-future"),
         ];
         for mode in cases {
             let s = mode.as_str();
-            let round = BuildMode::parse(&s);
+            let round = BuildMode::parse(s);
             assert_eq!(round, mode, "as_str → parse must round-trip for {mode:?}");
             // Display must agree with as_str so schema serialization is stable.
-            assert_eq!(format!("{mode}"), s.as_ref());
+            assert_eq!(format!("{mode}"), s);
         }
     }
 
@@ -969,7 +938,7 @@ mod moduledata {
 
         let mut total = 0usize;
         for pair in bin.itab_pairs().take(60) {
-            for va in bin.itab_methods(&pair) {
+            for va in bin.itab_methods(&pair).iter().map(|m| m.va) {
                 total += 1;
                 assert!(
                     va == 0 || (va >= text && va < etext),
@@ -1368,14 +1337,9 @@ mod wasm {
     fn wasm_inline_tree_yields_entries() {
         let data = load(BASIC_WASM);
         let bin = GoBinary::parse(&data).unwrap();
-        let pcl = bin.pclntab().unwrap();
 
         let mut total_entries = 0usize;
-        for (_, off) in pcl.func_entries().take(200) {
-            let func = match pcl.parse_func(off) {
-                Some(f) => f,
-                None => continue,
-            };
+        for func in bin.functions().take(200) {
             total_entries += bin.inline_tree(&func).count();
             if total_entries > 0 {
                 break;
@@ -2187,58 +2151,6 @@ mod types {
     }
 
     #[test]
-    fn decode_pcln_with_files_attributes_source_file_per_line() {
-        let data = load(BASIC_NORMAL);
-        let bin = GoBinary::parse(&data).unwrap();
-        let pcl = bin.pclntab().unwrap();
-
-        // Find a function with both pcln and pcfile entries.
-        let mut joined_total = 0usize;
-        let mut at_least_one_function = false;
-        for (_, off) in pcl.func_entries() {
-            let f = match pcl.parse_func(off) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            // Reference data: per-PC pcln + the latest-≤-pc pcfile resolution.
-            let pcfile: Vec<(u32, u32)> = pcl.decode_pcfile(&f).collect();
-            if pcfile.is_empty() {
-                continue;
-            }
-            at_least_one_function = true;
-
-            // Joined iterator must agree with the manual lockstep walk on every
-            // emitted (pc, line, path) tuple.
-            for (pc, line, path) in pcl.decode_pcln_with_files(&f) {
-                joined_total += 1;
-
-                // Expected file index = latest pcfile transition with t_pc ≤ pc.
-                let expected_idx = pcfile
-                    .iter()
-                    .rev()
-                    .find(|(t_pc, _)| *t_pc <= pc)
-                    .map(|(_, idx)| *idx)
-                    .unwrap();
-                let expected_path = pcl.resolve_file_via_cu(f.cu_offset, expected_idx).unwrap();
-                assert_eq!(path, expected_path, "joined path mismatch at pc={pc}");
-
-                // Line must be a sane source line (not absurdly large).
-                assert!((0..1_000_000).contains(&line), "implausible line {line}");
-
-                if joined_total > 50 {
-                    break;
-                }
-            }
-            if joined_total > 50 {
-                break;
-            }
-        }
-        assert!(at_least_one_function, "expected pcfile entries somewhere");
-        assert!(joined_total > 0, "joined iterator yielded nothing");
-    }
-
-    #[test]
     fn decode_pcfile_returns_unsigned_indices() {
         let data = load(BASIC_NORMAL);
         let bin = GoBinary::parse(&data).unwrap();
@@ -2246,15 +2158,11 @@ mod types {
 
         let mut saw_indices = false;
         let mut saw_resolved = false;
-        for (_, func_off) in pcl.func_entries() {
-            let func = match pcl.parse_func(func_off) {
-                Some(f) => f,
-                None => continue,
-            };
-            if pcl.decode_pcfile(&func).next().is_some() {
+        for func in bin.functions() {
+            if pcl.decode_pcfile(&func.func).next().is_some() {
                 saw_indices = true;
             }
-            if pcl.decode_pcfile_paths(&func).next().is_some() {
+            if pcl.decode_pcfile_paths(&func.func).next().is_some() {
                 saw_resolved = true;
             }
             if saw_indices && saw_resolved {
@@ -2326,13 +2234,18 @@ mod matrix {
             }
             // Peel an optional build variant (stripped / cover / fips / pie) to
             // expose the underlying <prog>_go<NN>_<goos>_<goarch> name.
-            let core = ["_stripped", "_cover", "_fips", "_pie"]
+            // Variants combine (`_cover_stripped`), so peel until none is left.
+            let mut core = name;
+            while let Some(rest) = ["_stripped", "_cover", "_fips", "_pie", "_cgobindings"]
                 .iter()
-                .find_map(|v| name.strip_suffix(v))
-                .unwrap_or(name);
+                .find_map(|v| core.strip_suffix(v))
+            {
+                core = rest;
+            }
             let parts: Vec<&str> = core.split('_').collect();
-            // <prog>_go<NN>_<goos>_<goarch>
-            if parts.len() != 4 || !parts[1].starts_with("go") {
+            // <prog>_go<NN>_<goos>_<goarch>. A universal Mach-O file holds
+            // several images, read one at a time (`mod universal`).
+            if parts.len() != 4 || !parts[1].starts_with("go") || parts[3] == "universal" {
                 continue;
             }
             out.push(Fixture {
@@ -2382,7 +2295,7 @@ mod matrix {
         match goos {
             "darwin" => BinaryFormat::MachO,
             "windows" => BinaryFormat::Pe,
-            "wasip1" => BinaryFormat::Wasm,
+            "wasip1" | "js" => BinaryFormat::Wasm,
             _ => BinaryFormat::Elf,
         }
     }
@@ -2390,6 +2303,7 @@ mod matrix {
     fn expected_arch(goarch: &str) -> Arch {
         match goarch {
             "amd64" => Arch::X86_64,
+            "386" => Arch::X86,
             "arm64" => Arch::Arm64,
             "wasm" => Arch::Wasm,
             other => panic!("unmapped goarch {other}"),
@@ -2416,7 +2330,7 @@ mod matrix {
         // Every parser-relevant version boundary must be represented.
         for t in [
             "go12", "go14", "go15", "go17", "go18", "go19", "go110", "go112", "go115", "go116",
-            "go117", "go118", "go120", "go121", "go124", "go126", "go127",
+            "go117", "go118", "go120", "go121", "go124", "go126", "go127", "go128",
         ] {
             assert!(tags.contains(t), "matrix is missing version {t}");
         }
@@ -2579,7 +2493,7 @@ mod matrix {
             assert!(text != 0, "{}: zero text_va", fx.path);
 
             let main = bin.functions().find(|f| f.name == "main.main").unwrap();
-            let va = text + u64::from(main.entry_offset);
+            let va = text + u64::from(main.func.entry_off);
             assert!(va >= text, "{}: main.main below text", fx.path);
             if let Some(etext) = bin.etext_va() {
                 assert!(va < etext, "{}: main.main past etext", fx.path);
@@ -2814,6 +2728,7 @@ mod matrix {
     /// comes from the note and has none.
     #[test]
     fn build_id_blob_frames_the_build_id_across_corpus() {
+        use gobin::structures::buildid::BuildIdSource;
         const OPEN: &[u8] = b"\xff Go build ID: \"";
         const CLOSE: &[u8] = b"\"\n \xff";
         let mut paths: Vec<String> = discover().into_iter().map(|f| f.path).collect();
@@ -2824,7 +2739,7 @@ mod matrix {
             let data = load(path);
             let bin = GoBinary::parse(&data).unwrap_or_else(|| panic!("{path}: parse failed"));
             let format = bin.context().format();
-            let Some(blob) = bin.build_id_blob() else {
+            let Some(BuildIdSource::Marker { blob }) = bin.build_id_source() else {
                 assert!(
                     format == BinaryFormat::Elf || bin.build_id().is_none(),
                     "{path}: a {format:?} build ID has a blob"
@@ -2858,11 +2773,12 @@ mod matrix {
     /// The ELF note is the only build ID an ELF image carries.
     #[test]
     fn build_id_blob_is_absent_for_an_elf_note() {
+        use gobin::structures::buildid::BuildIdSource;
         let data = load(BASIC_GO127_LINUX);
         let bin = GoBinary::parse(&data).unwrap();
         assert!(bin.context().sections().has_go_buildid_note);
         assert!(bin.build_id().is_some());
-        assert_eq!(bin.build_id_blob(), None);
+        assert_eq!(bin.build_id_source(), Some(&BuildIdSource::ElfNote));
     }
 
     /// The section holding the last Go byte ends at or past `etext`, and only
@@ -3077,7 +2993,7 @@ mod matrix {
                         fx.path
                     );
                     assert!(
-                        info.cgo_enabled().is_some(),
+                        info.cgo_mode().is_some(),
                         "{}: no CGO_ENABLED setting",
                         fx.path
                     );
@@ -3100,7 +3016,7 @@ mod matrix {
                 "{}: main class",
                 fx.path
             );
-            assert!(main.entry_offset > 0, "{}: main entry_offset", fx.path);
+            assert!(main.func.entry_off > 0, "{}: main entry_offset", fx.path);
 
             let rt = funcs.iter().find(|f| f.name == "runtime.main").unwrap();
             assert!(
@@ -3146,13 +3062,19 @@ mod matrix {
 
     #[test]
     fn metadata_consistent_across_formats() {
-        // The same Go version built for different native formats must report an
-        // identical go_version string and pclntab layout. Wasm is excluded: its
-        // reconstructed-linear-memory metadata legitimately differs (e.g. the
-        // version string drops the gotip `-devel` suffix).
+        // The same Go version built for different formats must report an
+        // identical toolchain version and pclntab layout. A wasm module states
+        // its version in its `producers` section, which records the toolchain
+        // version without the ` X:<experiments>` suffix `runtime.Version`
+        // appends for a non-default GOEXPERIMENT (the `_cgobindings`
+        // variant), so the comparison is of the toolchain version alone.
+        let toolchain = |bin: &GoBinary<'_>| {
+            bin.go_version()
+                .map(|v| v.split(" X:").next().unwrap_or(v).to_string())
+        };
         let mut by_tag: std::collections::BTreeMap<String, Vec<Fixture>> =
             std::collections::BTreeMap::new();
-        for fx in basics().into_iter().filter(|f| f.goarch != "wasm") {
+        for fx in basics() {
             by_tag.entry(fx.gotag.clone()).or_default().push(fx);
         }
         for (tag, group) in by_tag.iter().filter(|(_, g)| g.len() > 1) {
@@ -3162,11 +3084,11 @@ mod matrix {
                 .map(|(fx, d)| (*fx, GoBinary::parse(d).unwrap()))
                 .collect();
             let (_, first) = &bins[0];
-            let v0 = first.go_version();
+            let v0 = toolchain(first);
             let p0 = first.pclntab().map(|p| p.version);
             for (fx, bin) in &bins[1..] {
                 assert_eq!(
-                    bin.go_version(),
+                    toolchain(bin),
                     v0,
                     "{tag}: go_version differs at {}",
                     fx.path
@@ -3331,8 +3253,8 @@ mod harness {
                 .unwrap_or(0);
             if minor >= 18 {
                 assert_eq!(
-                    bin.build_info().and_then(|bi| bi.cgo_enabled()),
-                    Some(true),
+                    bin.build_info().and_then(|bi| bi.cgo_mode()),
+                    Some(gobin::metadata::CgoMode::Enabled),
                     "{path}: CGO_ENABLED not reported"
                 );
             }
@@ -3387,5 +3309,1888 @@ mod laid_out_types {
             beyond > 0,
             "the scan reaches no type the tables do not name"
         );
+    }
+}
+
+// ===========================================================================
+// Code addresses, version strings and build modes across every encoding:
+// wasm's three text-offset encodings, the development toolchain's version
+// form, and Go 1.28's third cgo mode.
+// ===========================================================================
+mod addressing_and_versions {
+    use super::matrix::discover;
+    use super::*;
+    use gobin::{formats::BinaryFormat, structures::moduledata::ModuledataVersion};
+
+    /// Go code is not in a wasm module's linear memory, and the Go linker
+    /// writes no segment for the leading zeros of its data, so below the
+    /// first segment there is only zero-fill. Before Go 1.28 `runtime.text`
+    /// was 0 and the text range `[text, etext)` happened to cover that span;
+    /// Go 1.28 moved the PCs to `1 << 63`, and small integer pairs read as
+    /// `(ptr, len)` began resolving there as all-zero "strings".
+    #[test]
+    fn wasm_strings_start_in_initialized_data() {
+        let mut checked = 0usize;
+        for fx in discover().into_iter().filter(|f| f.goarch == "wasm") {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let floor = bin
+                .context()
+                .wasm_initialized_start()
+                .unwrap_or_else(|| panic!("{}: no data segment", fx.path));
+            for s in bin.strings() {
+                assert!(
+                    s.va >= floor,
+                    "{}: string at {:#x} below the first data segment {floor:#x}",
+                    fx.path,
+                    s.va
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 8, "expected the wasm fixtures, found {checked}");
+    }
+
+    /// The arbiter that picks the moduledata layout must accept every real
+    /// image's moduledata. Its `rodata >= text` rule holds only where code
+    /// and data share an address space; Go 1.28 wasm puts `text` at `1 << 63`.
+    #[test]
+    fn located_moduledata_is_self_consistent() {
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let Some(md) = bin.moduledata() else {
+                continue;
+            };
+            if md.version == ModuledataVersion::V1 {
+                continue;
+            }
+            let wasm = bin.context().format() == BinaryFormat::Wasm;
+            assert!(
+                md.layout_self_consistent(wasm),
+                "{}: located moduledata fails its own consistency check",
+                fx.path
+            );
+        }
+    }
+
+    /// An itab's method words are code pointers, so each must translate to a
+    /// function's entry and back. On wasm this pins all three encodings of a
+    /// text offset: a PC offset through Go 1.24, a function index shifted into
+    /// a PC from Go 1.25, and that PC based at `1 << 63` from Go 1.28.
+    #[test]
+    fn itab_method_pointers_are_function_entries() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let entries: BTreeSet<u32> = bin.functions().map(|f| f.func.entry_off).collect();
+            for pair in bin.itab_pairs() {
+                // A zero word is an unbound method: Go 1.7-1.9 link their itabs
+                // with the method words empty for the runtime to fill at init.
+                // From Go 1.10 the linker binds every method of every itab it
+                // emits, so a zero there is a misplaced read.
+                let methods: Vec<u64> = bin.itab_methods(&pair).iter().map(|m| m.va).collect();
+                if super::matrix::tag_minor(&fx.gotag) >= 10 {
+                    assert!(
+                        !methods.contains(&0),
+                        "{}: itab {:#x} has an unbound method word",
+                        fx.path,
+                        pair.itab_va
+                    );
+                }
+                for pc in methods.into_iter().filter(|&pc| pc != 0) {
+                    let off = bin.text_off(pc).unwrap_or_else(|| {
+                        panic!("{}: method pointer {pc:#x} is in no text section", fx.path)
+                    });
+                    assert!(
+                        entries.contains(&off),
+                        "{}: method pointer {pc:#x} (text offset {off:#x}) is no function entry",
+                        fx.path
+                    );
+                    assert_eq!(bin.text_addr(off), Some(pc), "{}: {pc:#x}", fx.path);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "too few itab methods checked: {checked}");
+    }
+
+    /// An itab's `hash` copies its concrete type's (Go 1.5-1.8 records none,
+    /// so the pair carries the type's), and its layout matches its Go
+    /// version: the `link` word of Go 1.5-1.9, the padding of Go 1.10-1.22,
+    /// `internal/abi.ITab` from Go 1.23.
+    #[test]
+    fn itab_hashes_and_layouts_match_their_go_version() {
+        use gobin::structures::itab::ItabLayout;
+
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let types: std::collections::BTreeMap<u64, u32> =
+                bin.types().map(|t| (t.descriptor_va, t.hash)).collect();
+            let mut pairs = 0usize;
+            for pair in bin.itab_pairs() {
+                if let Some(&hash) = types.get(&pair.concrete_type_va) {
+                    assert_eq!(pair.hash, hash, "{}: itab {:#x}", fx.path, pair.itab_va);
+                    checked += 1;
+                }
+                pairs += 1;
+            }
+            if pairs > 0 {
+                let minor = super::matrix::tag_minor(&fx.gotag);
+                assert_eq!(
+                    bin.itab_layout(),
+                    ItabLayout::for_go_minor(minor),
+                    "{}",
+                    fx.path
+                );
+            }
+        }
+        assert!(checked > 500, "too few itab hashes checked: {checked}");
+
+        // With its version scrubbed, a 32-bit Go 1.21 binary still reads as
+        // padded, from the zero word after its first itab's hash.
+        let data = load("tests/samples/basic_go121_linux_386_noversion");
+        let bin = GoBinary::parse(&data).unwrap();
+        assert!(
+            !bin.go_version().is_some_and(|v| v.starts_with("go1.")),
+            "{:?}",
+            bin.go_version()
+        );
+        assert_eq!(bin.itab_layout(), ItabLayout::Padded);
+        let entries: BTreeSet<u32> = bin.functions().map(|f| f.func.entry_off).collect();
+        let methods: Vec<u64> = bin
+            .itab_pairs()
+            .flat_map(|pair| bin.itab_methods(&pair))
+            .map(|m| m.va)
+            .collect();
+        assert!(!methods.is_empty());
+        for pc in methods {
+            assert!(
+                bin.text_off(pc).is_some_and(|off| entries.contains(&off)),
+                "{pc:#x} is no function entry"
+            );
+        }
+    }
+
+    /// Every function's entry PC, and every PC inside it, finds that
+    /// function; the PCs around the code find none. Sweeps every pclntab
+    /// layout, including Go 1.2-1.17's absolute function-table entries and
+    /// wasm's three text-offset encodings.
+    #[test]
+    fn function_at_finds_the_function_holding_a_pc() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let funcs: Vec<_> = bin.functions().collect();
+            for pair in funcs.windows(2) {
+                let (f, next) = (&pair[0], &pair[1]);
+                let Some(entry) = bin.entry_va(f) else {
+                    continue;
+                };
+                let found = bin.function_at(entry).map(|g| g.func.entry_off);
+                assert_eq!(found, Some(f.func.entry_off), "{}: {}", fx.path, f.name);
+                // The last PC before the next function is still this one.
+                let last = bin.entry_va(next).unwrap() - 1;
+                let found = bin.function_at(last).map(|g| g.func.entry_off);
+                assert_eq!(
+                    found,
+                    Some(f.func.entry_off),
+                    "{}: end of {}",
+                    fx.path,
+                    f.name
+                );
+                checked += 1;
+            }
+            if let Some(text) = bin.text_va().filter(|&t| t > 0) {
+                assert!(bin.function_at(text - 1).is_none(), "{}", fx.path);
+            }
+            if let Some(etext) = bin.etext_va() {
+                assert!(bin.function_at(etext).is_none(), "{}", fx.path);
+            }
+        }
+        assert!(checked > 100_000, "too few functions checked: {checked}");
+    }
+
+    /// The funcID list of the Go minor version `minor`, copied from that
+    /// release's source (`cmd/internal/objabi/funcid.go`, then
+    /// `runtime/symtab.go`, then `internal/abi/symtab.go`): entry `n` names
+    /// raw ID `n`. An oracle independent of the classifier, which reads IDs
+    /// by name and by the binary's wrapper ID, never by these numbers.
+    fn funcid_list(minor: u32) -> Vec<&'static str> {
+        let list = match minor {
+            10 => {
+                "normal goexit jmpdefer mcall morestack mstart rt0_go asmcgocall sigpanic runfinq bgsweep forcegchelper timerproc gcBgMarkWorker systemstack_switch systemstack cgocallback gogo externalthreadhandler"
+            }
+            11 => {
+                "normal runtime_main goexit jmpdefer mcall morestack mstart rt0_go asmcgocall sigpanic runfinq gcBgMarkWorker systemstack_switch systemstack cgocallback gogo externalthreadhandler debugCallV1"
+            }
+            12 | 13 => {
+                "normal runtime_main goexit jmpdefer mcall morestack mstart rt0_go asmcgocall sigpanic runfinq gcBgMarkWorker systemstack_switch systemstack cgocallback gogo externalthreadhandler debugCallV1 gopanic panicwrap wrapper"
+            }
+            14..=16 => {
+                "normal runtime_main goexit jmpdefer mcall morestack mstart rt0_go asmcgocall sigpanic runfinq gcBgMarkWorker systemstack_switch systemstack cgocallback gogo externalthreadhandler debugCallV1 gopanic panicwrap handleAsyncEvent asyncPreempt wrapper"
+            }
+            17 => {
+                "normal abort asmcgocall asyncPreempt cgocallback debugCallV2 gcBgMarkWorker goexit gogo gopanic handleAsyncEvent jmpdefer mcall morestack mstart panicwrap rt0_go runfinq runtime_main sigpanic systemstack systemstack_switch wrapper"
+            }
+            18..=21 => {
+                "normal abort asmcgocall asyncPreempt cgocallback debugCallV2 gcBgMarkWorker goexit gogo gopanic handleAsyncEvent mcall morestack mstart panicwrap rt0_go runfinq runtime_main sigpanic systemstack systemstack_switch wrapper"
+            }
+            22..=24 => {
+                "normal abort asmcgocall asyncPreempt cgocallback corostart debugCallV2 gcBgMarkWorker goexit gogo gopanic handleAsyncEvent mcall morestack mstart panicwrap rt0_go runfinq runtime_main sigpanic systemstack systemstack_switch wrapper"
+            }
+            _ => {
+                "normal abort asmcgocall asyncPreempt cgocallback corostart debugCallV2 gcBgMarkWorker goexit gogo gopanic handleAsyncEvent mcall morestack mstart panicwrap rt0_go runtime_main runFinalizers runCleanups sigpanic systemstack systemstack_switch wrapper"
+            }
+        };
+        list.split(' ').collect()
+    }
+
+    /// Every function's funcID classifies to the name Go's own list gives its
+    /// raw number, on every fixture from Go 1.10 (the first with IDs). Pins
+    /// the version-free classification, the wrapper-ID detection (Go 1.17's
+    /// ABI wrappers share their function's name), and the Go 1.10-1.15
+    /// `_func` layouts the ID is read from. (`cgocallback_gofunc` reads as
+    /// `cgocallback`, its later name, in the lists.)
+    #[test]
+    fn func_ids_match_the_go_source_lists() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let minor = super::matrix::tag_minor(&fx.gotag);
+            if minor < 10 {
+                continue;
+            }
+            let list = funcid_list(minor);
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let mut specials = 0usize;
+            for f in bin.functions() {
+                let want = list
+                    .get(usize::from(f.func.func_id))
+                    .unwrap_or_else(|| panic!("{}: {} raw {}", fx.path, f.name, f.func.func_id));
+                assert_eq!(
+                    f.func_id.as_str(),
+                    *want,
+                    "{}: {} raw {}",
+                    fx.path,
+                    f.name,
+                    f.func.func_id
+                );
+                if !matches!(f.func_id, FuncId::Normal | FuncId::Wrapper) {
+                    specials += 1;
+                }
+                checked += 1;
+            }
+            assert!(specials >= 10, "{}: {specials} special functions", fx.path);
+        }
+        assert!(checked > 100_000, "too few functions checked: {checked}");
+    }
+
+    /// The Go 1.2-1.15 `_func` record is read with the layout its era wrote:
+    /// the word after `args` is a frame size (or Go 1.5-1.9's placeholder),
+    /// the funcID (Go 1.10-1.11), then `deferreturn` (Go 1.12-1.15). So no
+    /// function before Go 1.12 reports a `deferreturn`, the basic program's
+    /// deferring function does from Go 1.12, and `nfuncdata` is read.
+    #[test]
+    fn legacy_func_records_use_their_eras_layout() {
+        use gobin::structures::pclntab::LegacyFuncLayout;
+
+        for fx in discover().into_iter().filter(|f| f.prog == "basic") {
+            let minor = super::matrix::tag_minor(&fx.gotag);
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let want = match minor {
+                0..=4 => Some(LegacyFuncLayout::FrameSize),
+                5..=9 => Some(LegacyFuncLayout::FramePlaceholder),
+                10 | 11 => Some(LegacyFuncLayout::FuncIdWord),
+                12..=15 => Some(LegacyFuncLayout::DeferReturn),
+                _ => None,
+            };
+            assert_eq!(bin.pclntab().unwrap().legacy_func, want, "{}", fx.path);
+            let funcs: Vec<_> = bin.functions().collect();
+            let deferring = funcs.iter().filter(|f| f.uses_defer()).count();
+            if minor < 12 {
+                assert_eq!(deferring, 0, "{}: deferreturn before Go 1.12", fx.path);
+            } else {
+                assert!(
+                    funcs
+                        .iter()
+                        .any(|f| f.name.starts_with("main.") && f.uses_defer()),
+                    "{}: no main function defers",
+                    fx.path
+                );
+            }
+            let with_funcdata = funcs.iter().filter(|f| f.func.nfuncdata > 0).count();
+            assert!(
+                with_funcdata * 2 > funcs.len(),
+                "{}: {with_funcdata} of {} functions carry funcdata",
+                fx.path,
+                funcs.len()
+            );
+        }
+    }
+
+    /// An init task holds its functions' PCs; every one names a function, on
+    /// wasm as everywhere else.
+    #[test]
+    fn init_functions_resolve_to_names() {
+        let mut wasm_named = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            for task in bin.init_order() {
+                for func in &task.functions {
+                    assert!(
+                        func.name.is_some(),
+                        "{}: init function at {:#x} has no name",
+                        fx.path,
+                        func.entry_va
+                    );
+                    if fx.goarch == "wasm" {
+                        wasm_named += 1;
+                    }
+                }
+            }
+        }
+        assert!(wasm_named > 50, "too few wasm init functions: {wasm_named}");
+    }
+
+    /// The development toolchain's version string carries its commit, and a
+    /// wasm module states the whole string in its `producers` section.
+    #[test]
+    fn development_toolchain_version_is_complete() {
+        let mut checked = 0usize;
+        for fx in discover().into_iter().filter(|f| f.gotag == "go128") {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let version = bin.go_version().unwrap();
+            assert!(
+                version.starts_with("go1.28-devel_"),
+                "{}: {version}",
+                fx.path
+            );
+            assert_eq!(bin.runtime_commit(), Some("2dbf8b413a"), "{}", fx.path);
+            checked += 1;
+        }
+        assert!(
+            checked >= 10,
+            "expected the go128 fixtures, found {checked}"
+        );
+        for fx in discover().into_iter().filter(|f| f.gotag == "go127") {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            assert_eq!(bin.runtime_commit(), None, "{}", fx.path);
+        }
+    }
+
+    /// `CGO_ENABLED` records three modes since Go 1.28.
+    #[test]
+    fn cgo_mode_matches_the_build() {
+        use gobin::metadata::CgoMode;
+
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let Some(mode) = bin.build_info().and_then(|bi| bi.cgo_mode()) else {
+                continue;
+            };
+            let want = if fx.path.ends_with("_cgobindings") {
+                CgoMode::Bindings
+            } else if fx.prog == "cgo" {
+                CgoMode::Enabled
+            } else {
+                CgoMode::Disabled
+            };
+            assert_eq!(mode, want, "{}", fx.path);
+        }
+        let bindings = load("tests/samples/basic_go128_linux_amd64_cgobindings");
+        let bin = GoBinary::parse(&bindings).unwrap();
+        assert_eq!(
+            bin.build_info().and_then(|bi| bi.cgo_mode()),
+            Some(CgoMode::Bindings)
+        );
+    }
+}
+
+// ===========================================================================
+// Per-function data blocks and per-PC tables (FUNCDATA / PCDATA), decoded in
+// the format of each Go version, against oracles independent of the decoders.
+// ===========================================================================
+mod funcdata_blocks {
+    use super::matrix::{discover, tag_minor};
+    use super::*;
+    use gobin::structures::funcdata::{ArgItem, FuncDataKind, OpenDefers, PcDataKind, StackObject};
+
+    /// The runtime throws "bad symbol table" when a PC's
+    /// `PCDATA_StackMapIndex` names a pointer map the function's
+    /// `FUNCDATA_LocalsPointerMaps` does not have, so on every real binary each
+    /// index is below the map count. Pins the per-version `FUNCDATA` and
+    /// `PCDATA` indices, the pointer-or-offset block references, and the end
+    /// of every PC-value table (one read past its terminator reads the next).
+    #[test]
+    fn stack_map_indices_name_existing_maps() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            // A block that fails to decode is skipped below, so also require
+            // that nearly every function with GC maps has them decode: a
+            // misplaced block reference reads as an unmapped address.
+            let (mut with_maps, mut decoded) = (0usize, 0usize);
+            for f in bin.functions() {
+                if f.func.nfuncdata >= 2 {
+                    with_maps += 1;
+                }
+                let Some(maps) = bin.pointer_maps(&f, FuncDataKind::LocalsPointerMaps) else {
+                    continue;
+                };
+                decoded += 1;
+                let Some(table) = bin.pcdata(&f, PcDataKind::StackMapIndex) else {
+                    continue;
+                };
+                for (_, index) in table {
+                    if let Ok(index) = u32::try_from(index) {
+                        assert!(
+                            index < maps.count,
+                            "{}: {} index {index} of {} maps",
+                            fx.path,
+                            f.name,
+                            maps.count
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            // Go 1.2 binaries state no version, and its maps' format is not
+            // that of Go 1.3-1.4, so none decode there by design.
+            if fx.gotag != "go12" {
+                assert!(
+                    decoded * 10 >= with_maps * 9,
+                    "{}: {decoded} of {with_maps} functions' maps decode",
+                    fx.path
+                );
+            }
+        }
+        assert!(checked > 100_000, "too few indices checked: {checked}");
+    }
+
+    /// An inlined call's record names its call site, and from Go 1.12 also
+    /// `parentPc`, "an instruction whose source position is the call site":
+    /// the line table at that PC is the record's line. From Go 1.20 the record
+    /// carries the callee's first line instead, which is that function's own
+    /// `startLine` wherever a standalone copy of it exists. Both oracles come
+    /// from tables the inline decoder does not read.
+    #[test]
+    fn inline_records_agree_with_the_line_tables() {
+        let mut lines_checked = 0usize;
+        let mut starts_checked = 0usize;
+        for fx in discover() {
+            let minor = tag_minor(&fx.gotag);
+            if minor < 9 {
+                continue;
+            }
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let pcl = bin.pclntab().unwrap();
+            // Names are not unique (Go 1.17's ABI wrappers share theirs), so
+            // the oracle is every start line a name has.
+            let mut starts: std::collections::BTreeMap<&str, BTreeSet<i32>> = Default::default();
+            for f in bin.functions() {
+                starts.entry(f.name).or_default().insert(f.func.start_line);
+            }
+            let mut entries = 0usize;
+            for f in bin.functions() {
+                let lines: Vec<(u32, i32)> = pcl.decode_pcln(&f.func).collect();
+                let line_at = |pc: u32| lines.iter().find(|(end, _)| pc < *end).map(|e| e.1);
+                for e in bin.inline_tree(&f) {
+                    entries += 1;
+                    assert!(
+                        e.function_name.contains('.'),
+                        "{}: {} inlines {:?}",
+                        fx.path,
+                        f.name,
+                        e.function_name
+                    );
+                    if let (Some(pc), Some(line)) = (e.parent_pc, e.call_line) {
+                        assert_eq!(line_at(pc), Some(line), "{}: {}", fx.path, f.name);
+                        lines_checked += 1;
+                    }
+                    if let (Some(start), Some(own)) = (e.start_line, starts.get(e.function_name)) {
+                        assert!(
+                            own.contains(&start),
+                            "{}: {} {start} not in {own:?}",
+                            fx.path,
+                            e.function_name
+                        );
+                        starts_checked += 1;
+                    }
+                }
+            }
+            assert!(entries > 0, "{}: no inline tree", fx.path);
+        }
+        assert!(
+            lines_checked > 50_000,
+            "call lines checked: {lines_checked}"
+        );
+        assert!(
+            starts_checked > 1_000,
+            "start lines checked: {starts_checked}"
+        );
+    }
+
+    /// Without a version string the tables are read only where every Go
+    /// version the structure allows agrees on their format. A scrubbed Go
+    /// 1.21 / 1.24 binary's structure allows Go 1.20-1.25: the block indices
+    /// and the pointer maps agree, so they decode, while the open-coded defer
+    /// format changed at Go 1.22, so it is not guessed. A Go 1.2 binary, which
+    /// states no version, could be Go 1.2-1.4, whose PCDATA 0 and pointer maps
+    /// differ, so neither decodes.
+    #[test]
+    fn versionless_binaries_decode_only_what_their_structure_fixes() {
+        for path in [
+            "tests/samples/basic_go121_linux_386_noversion",
+            "tests/samples/basic_go124_windows_amd64_noversion.exe",
+        ] {
+            let data = load(path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let worker = bin.functions().find(|f| f.name == "main.worker").unwrap();
+            assert!(
+                bin.pointer_maps(&worker, FuncDataKind::LocalsPointerMaps)
+                    .is_some(),
+                "{path}"
+            );
+            assert!(bin.arg_layout(&worker).is_some(), "{path}");
+            assert!(
+                bin.funcdata(&worker, FuncDataKind::OpenCodedDeferInfo)
+                    .is_some(),
+                "{path}"
+            );
+            assert!(bin.open_defers(&worker).is_none(), "{path}");
+        }
+        let data = load("tests/samples/basic_go12_linux_amd64");
+        let bin = GoBinary::parse(&data).unwrap();
+        assert_eq!(bin.go_version(), None);
+        for f in bin.functions() {
+            assert!(
+                bin.pcdata(&f, PcDataKind::StackMapIndex).is_none(),
+                "{}",
+                f.name
+            );
+            assert!(
+                bin.pointer_maps(&f, FuncDataKind::LocalsPointerMaps)
+                    .is_none(),
+                "{}",
+                f.name
+            );
+        }
+    }
+
+    /// The argument layout of `main.worker(ch chan int, n int)`: two
+    /// pointer-sized words, and of `main.TestStruct.Greet`, whose receiver is
+    /// `struct{ Name string; Count int }`: a string (pointer, length) and an
+    /// int inside one aggregate. Recorded from Go 1.17.
+    #[test]
+    fn arg_layout_matches_the_signatures() {
+        let mut checked = 0usize;
+        for fx in discover().into_iter().filter(|f| f.prog == "basic") {
+            if tag_minor(&fx.gotag) < 17 {
+                continue;
+            }
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let p = bin.pclntab().unwrap().ptr_size;
+            let word = |offset: u8| ArgItem::Value { offset, size: p };
+            let find = |name: &str| bin.functions().find(|f| f.name == name).unwrap();
+            let worker = bin.arg_layout(&find("main.worker")).unwrap();
+            assert_eq!(worker.items, vec![word(0), word(p)], "{}", fx.path);
+            let greet = bin.arg_layout(&find("main.TestStruct.Greet")).unwrap();
+            assert_eq!(
+                greet.items,
+                vec![ArgItem::Aggregate(vec![
+                    ArgItem::Aggregate(vec![word(0), word(p)]),
+                    word(2 * p),
+                ])],
+                "{}",
+                fx.path
+            );
+            checked += 1;
+        }
+        assert!(checked >= 15, "fixtures checked: {checked}");
+    }
+
+    /// `main.worker` defers one call (`defer close(ch)`), which the compiler
+    /// open-codes from Go 1.14: the defer info lists it through Go 1.21 and
+    /// gives its slots from Go 1.22.
+    #[test]
+    fn open_defers_find_the_one_deferred_call() {
+        let mut checked = 0usize;
+        for fx in discover().into_iter().filter(|f| f.prog == "basic") {
+            let minor = tag_minor(&fx.gotag);
+            if minor < 14 {
+                continue;
+            }
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let worker = bin.functions().find(|f| f.name == "main.worker").unwrap();
+            let defers = bin
+                .open_defers(&worker)
+                .unwrap_or_else(|| panic!("{}", fx.path));
+            match defers {
+                OpenDefers::Listed { calls, .. } => {
+                    assert!(minor < 22, "{}", fx.path);
+                    assert_eq!(calls.len(), 1, "{}", fx.path);
+                }
+                OpenDefers::Slots { .. } => assert!(minor >= 22, "{}", fx.path),
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20, "fixtures checked: {checked}");
+    }
+
+    /// A function names the function it wraps only when the compiler marked
+    /// it a wrapper (its funcID), and the target resolves; the `go worker(ch,
+    /// 21)` statement's wrapper (Go 1.22+, on the register-ABI targets that
+    /// need one) wraps `main.worker`.
+    #[test]
+    fn wrapped_functions_resolve_from_wrappers() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let minor = tag_minor(&fx.gotag);
+            if minor < 18 {
+                continue;
+            }
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            for f in bin.functions() {
+                if bin.funcdata(&f, FuncDataKind::WrapInfo).is_none() {
+                    continue;
+                }
+                assert!(f.is_wrapper(), "{}: {} is not a wrapper", fx.path, f.name);
+                let target = bin.wrapped_function(&f);
+                assert!(target.is_some(), "{}: {} wraps nothing", fx.path, f.name);
+                checked += 1;
+            }
+            if fx.prog == "basic" && minor >= 22 && matches!(fx.goarch.as_str(), "amd64" | "arm64")
+            {
+                let gowrap = bin
+                    .functions()
+                    .find(|f| f.name == "main.main.gowrap1")
+                    .unwrap_or_else(|| panic!("{}", fx.path));
+                assert_eq!(
+                    bin.wrapped_function(&gowrap).map(|w| w.name),
+                    Some("main.worker"),
+                    "{}",
+                    fx.path
+                );
+            }
+        }
+        assert!(checked > 200, "wrappers checked: {checked}");
+    }
+
+    /// Go 1.12-1.16 record each stack object's type, which resolves to a type
+    /// descriptor; Go 1.17+ record its size and pointer bytes, which it holds.
+    #[test]
+    fn stack_objects_hold_types_or_sizes() {
+        let (mut typed, mut sized) = (0usize, 0usize);
+        for fx in discover() {
+            let minor = tag_minor(&fx.gotag);
+            if minor < 12 {
+                continue;
+            }
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            for f in bin.functions() {
+                for object in bin.stack_objects(&f).unwrap_or_default() {
+                    let StackObject {
+                        size,
+                        ptr_bytes,
+                        type_va,
+                        ..
+                    } = object;
+                    if minor <= 16 {
+                        let ty = type_va.and_then(|va| bin.type_at(va));
+                        assert!(ty.is_some(), "{}: {} object type", fx.path, f.name);
+                        typed += 1;
+                    } else {
+                        let (size, ptr) = (size.unwrap(), ptr_bytes.unwrap());
+                        assert!(size > 0 && ptr <= size as i32, "{}: {}", fx.path, f.name);
+                        sized += 1;
+                    }
+                }
+            }
+        }
+        assert!(typed > 500 && sized > 2_000, "typed {typed}, sized {sized}");
+    }
+}
+
+mod source_spans_and_methods {
+    use super::matrix::{discover, tag_minor};
+    use super::*;
+    use gobin::structures::types::{TypeDetail, TypeKind};
+    use std::collections::BTreeMap;
+
+    /// The value `(pc_end, value)` steps give `pc`, as the runtime's
+    /// `pcvalue` reads them: the first step ending after it.
+    fn value_at<T: Copy>(steps: &[(u32, T)], pc: u32) -> Option<T> {
+        steps.iter().find(|&&(end, _)| pc < end).map(|&(_, v)| v)
+    }
+
+    /// The functions `tests/samples/src/basic/main.go` declares, as
+    /// `(symbol, line of func, line of its closing brace)`.
+    fn basic_source_functions() -> Vec<(String, i32, i32)> {
+        source_functions("tests/samples/src/basic/main.go", "main")
+    }
+
+    /// The functions the Go source file `path` of package `package` declares,
+    /// as `(symbol, line of func, line of its closing brace)`.
+    pub fn source_functions(path: &str, package: &str) -> Vec<(String, i32, i32)> {
+        let src = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.strip_prefix("func ") else {
+                continue;
+            };
+            let symbol = match rest.strip_prefix('(') {
+                Some(recv) => {
+                    let (recv, rest) = recv.split_once(") ").unwrap();
+                    let ty = recv.split_whitespace().last().unwrap();
+                    let name = rest.split('(').next().unwrap();
+                    match ty.strip_prefix('*') {
+                        Some(ty) => format!("{package}.(*{ty}).{name}"),
+                        None => format!("{package}.{ty}.{name}"),
+                    }
+                }
+                None => format!("{package}.{}", rest.split('(').next().unwrap()),
+            };
+            let close = if line.trim_end().ends_with('}') {
+                i
+            } else {
+                i + lines[i..].iter().position(|l| *l == "}").unwrap()
+            };
+            out.push((symbol, i as i32 + 1, close as i32 + 1));
+        }
+        out
+    }
+
+    /// A function's source span leaves out the code inlined into it, whose
+    /// lines are its callees' (`fmt.Println`'s, in `print.go`, inside
+    /// `main.main`), and its line table holds absolute lines (Go 1.20 added
+    /// a start line beside it, which is no base to add). Checked against the
+    /// fixture's source: each function of `main.go` spans from its `func`
+    /// line to its last statement or closing brace. Fixtures built from a
+    /// copy of the source three lines shorter shift every line by `-3`.
+    #[test]
+    fn function_spans_match_the_source() {
+        let source = basic_source_functions();
+        let main = source
+            .iter()
+            .find(|(s, ..)| s == "main.main")
+            .unwrap()
+            .clone();
+        let mut checked = 0usize;
+        for fx in discover().into_iter().filter(|fx| fx.prog == "basic") {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let pcl = bin.pclntab().unwrap();
+            let span = |name: &str| {
+                bin.functions().find(|f| f.name == name).map(|f| {
+                    (
+                        pcl.line_range(&f.func),
+                        f.end_line,
+                        f.func.start_line,
+                        f.source_file,
+                    )
+                })
+            };
+            let (Some((lo, _)), ..) = span("main.main").unwrap() else {
+                panic!("{}: main.main has no lines", fx.path);
+            };
+            let shift = [0, -3]
+                .into_iter()
+                .find(|s| lo == main.1 + s)
+                .unwrap_or_else(|| panic!("{}: main.main starts at line {lo}", fx.path));
+            for (symbol, first, close) in &source {
+                let Some((range, end_line, start_line, file)) = span(symbol) else {
+                    continue; // inlined everywhere, or never compiled
+                };
+                let (first, close) = (first + shift, close + shift);
+                let (lo, hi) = range.unwrap();
+                assert_eq!(hi, end_line, "{}: {symbol}", fx.path);
+                assert!(
+                    file.unwrap().ends_with("main.go"),
+                    "{}: {symbol} {file:?}",
+                    fx.path
+                );
+                assert!(
+                    lo >= first,
+                    "{}: {symbol} starts at {lo}, before {first}",
+                    fx.path
+                );
+                if first == close {
+                    assert_eq!(hi, first, "{}: one-line {symbol}", fx.path);
+                } else {
+                    assert!(
+                        (close - 1..=close).contains(&hi),
+                        "{}: {symbol} ends at {hi}, its body at {}",
+                        fx.path,
+                        close - 1
+                    );
+                }
+                if tag_minor(&fx.gotag) >= 20 {
+                    assert_eq!(start_line, first, "{}: {symbol}", fx.path);
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 300, "too few spans checked: {checked}");
+    }
+
+    /// The bulk walk describes each function as the iterator does, its
+    /// tables decoded once into shared buffers: the same source file (Go
+    /// 1.2-1.15 resolve files without a compilation unit table) and span.
+    #[test]
+    fn for_each_function_agrees_with_functions() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let pcl = bin.pclntab().unwrap();
+            let mut iter = bin.functions();
+            for_each_function(&pcl, |info, _| {
+                let f = iter.next().unwrap();
+                assert_eq!(
+                    (
+                        info.name,
+                        info.source_file,
+                        info.end_line,
+                        info.frame_size,
+                        info.func_id
+                    ),
+                    (f.name, f.source_file, f.end_line, f.frame_size, f.func_id),
+                    "{}",
+                    fx.path
+                );
+                checked += 1;
+            });
+            assert!(iter.next().is_none(), "{}", fx.path);
+        }
+        assert!(checked > 100_000, "too few functions checked: {checked}");
+    }
+
+    /// Joining the line and file tables gives every PC the line and the file
+    /// the runtime's `pcvalue` reads for it from each table on its own.
+    #[test]
+    fn joined_lines_and_files_agree_with_each_table() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let pcl = bin.pclntab().unwrap();
+            for f in bin.functions().step_by(25) {
+                let lines: Vec<(u32, i32)> = pcl.decode_pcln(&f.func).collect();
+                let files: Vec<(u32, u32)> = pcl.decode_pcfile(&f.func).collect();
+                let joined: Vec<(u32, i32, &str)> = pcl.decode_pcln_with_files(&f.func).collect();
+                let end = lines.last().map_or(0, |&(end, _)| end);
+                for pc in 0..end {
+                    let Some(path) = value_at(&files, pc)
+                        .and_then(|i| pcl.resolve_file_index(f.func.cu_offset, i))
+                    else {
+                        continue;
+                    };
+                    let line = value_at(&lines, pc).unwrap();
+                    let item = joined.iter().find(|&&(end, ..)| pc < end);
+                    assert_eq!(
+                        item.map(|&(_, l, p)| (l, p)),
+                        Some((line, path)),
+                        "{}: {} pc {pc}",
+                        fx.path,
+                        f.name
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1_000_000, "too few PCs checked: {checked}");
+    }
+
+    /// An inlined call sits in its caller's code: the enclosing function's
+    /// own code for an outermost frame, else the parent inlined function's.
+    /// From Go 1.20 the call site is read from the enclosing function's
+    /// tables at `parentPc`; so its file must be the caller's source file (the
+    /// enclosing function's, or the parent's standalone copy's), and an
+    /// outermost call's line must fall in the enclosing function's span. An
+    /// inlined function's own file is its standalone copy's.
+    #[test]
+    fn inline_call_sites_lie_in_their_callers() {
+        let (mut outer, mut nested, mut callee) = (0usize, 0usize, 0usize);
+        let mut go19 = (0usize, 0usize); // (checked, agreeing)
+        for fx in discover()
+            .into_iter()
+            .filter(|fx| tag_minor(&fx.gotag) >= 9)
+        {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let files: BTreeMap<&str, BTreeSet<&str>> =
+                bin.functions().fold(BTreeMap::new(), |mut m, f| {
+                    if let Some(file) = f.source_file {
+                        m.entry(f.name).or_default().insert(file);
+                    }
+                    m
+                });
+            let own_file = |name: &str, file: Option<&str>| {
+                files
+                    .get(name)
+                    .is_none_or(|set| set.len() != 1 || file.is_some_and(|f| set.contains(f)))
+            };
+            for f in bin.functions() {
+                let entries: Vec<_> = bin.inline_tree(&f).collect();
+                let names: BTreeMap<u32, &str> =
+                    entries.iter().map(|e| (e.index, e.function_name)).collect();
+                for e in &entries {
+                    let at = format!(
+                        "{}: {} <- {} @{:?}",
+                        fx.path, f.name, e.function_name, e.pc_range
+                    );
+                    assert_eq!(e.parent.is_none(), e.depth == 0, "{at}");
+                    // Go 1.9 positions some inlined calls' code at the call
+                    // site only, which leaves the callee's file unrecorded:
+                    // count those, and require all from Go 1.10.
+                    let agrees = own_file(e.function_name, e.source_file);
+                    if tag_minor(&fx.gotag) >= 10 {
+                        assert!(agrees, "{at}: {:?}", e.source_file);
+                        callee += usize::from(files.contains_key(e.function_name));
+                    } else if files.get(e.function_name).is_some_and(|set| set.len() == 1) {
+                        go19.0 += 1;
+                        go19.1 += usize::from(agrees);
+                    }
+                    match e.parent {
+                        // A package's generated initializer runs the variable
+                        // initializers of all its files: it has no one file.
+                        None if f.name.ends_with(".init") => {}
+                        None => {
+                            let (lo, hi) = bin.pclntab().unwrap().line_range(&f.func).unwrap();
+                            assert_eq!(e.call_file, f.source_file, "{at}");
+                            // Before Go 1.12 a statement whose code was all
+                            // inlined leaves no instruction of the caller's at
+                            // its line, so the caller's span can end before it.
+                            let line = e.call_line.unwrap();
+                            if tag_minor(&fx.gotag) >= 12 {
+                                assert!(
+                                    (lo..=hi).contains(&line),
+                                    "{at}: line {line} not in {lo}-{hi}"
+                                );
+                            }
+                            outer += 1;
+                        }
+                        Some(parent) => {
+                            if let Some(name) = names.get(&parent) {
+                                assert!(
+                                    own_file(name, e.call_file),
+                                    "{at}: {:?} not {name}'s",
+                                    e.call_file
+                                );
+                                nested += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            outer > 20_000 && nested > 2_000 && callee > 20_000,
+            "{outer} {nested} {callee}"
+        );
+        // Go 1.9 also positions argument setup at the call site, inside the
+        // callee's range: the callee's file is the other one there.
+        assert!(
+            go19.0 > 100 && go19.1 * 100 >= go19.0 * 90,
+            "Go 1.9: {go19:?}"
+        );
+    }
+
+    /// A named type `T` shares the string `*T` with its pointer type and
+    /// marks it to drop the star (`tflagExtraStar`): a pointer's name is its
+    /// element's with one star before it, and only pointers start with one.
+    /// A named type is exported when its unqualified name is.
+    #[test]
+    fn type_names_drop_the_shared_star() {
+        let mut pointers = 0usize;
+        for fx in discover()
+            .into_iter()
+            .filter(|fx| tag_minor(&fx.gotag) >= 7)
+        {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let types = bin.all_types();
+            assert!(!types.is_empty(), "{}", fx.path);
+            for t in &types {
+                if t.kind != TypeKind::Pointer {
+                    assert!(
+                        !t.name.starts_with('*'),
+                        "{}: {:?} {}",
+                        fx.path,
+                        t.kind,
+                        t.name
+                    );
+                    continue;
+                }
+                // A named pointer type (`type dequeueNil *struct{}`) has its
+                // own name.
+                let (TypeDetail::Pointer { elem_va }, false) = (&t.detail, t.is_named) else {
+                    continue;
+                };
+                let elem_va = *elem_va;
+                if let Some(elem) = bin.type_at(elem_va).filter(|e| !e.name.is_empty()) {
+                    assert_eq!(t.name, format!("*{}", elem.name), "{}", fx.path);
+                    pointers += 1;
+                }
+            }
+            let exported =
+                |name: &str| types.iter().find(|t| t.name == name).map(|t| t.is_exported);
+            if fx.prog == "basic" {
+                assert_eq!(exported("main.TestStruct"), Some(true), "{}", fx.path);
+                assert_eq!(exported("*main.TestStruct"), Some(false), "{}", fx.path);
+                assert_eq!(exported("runtime.errorString"), Some(false), "{}", fx.path);
+                assert_eq!(exported("int"), Some(false), "{}", fx.path);
+            }
+        }
+        assert!(
+            pointers > 10_000,
+            "too few pointer types checked: {pointers}"
+        );
+    }
+
+    /// The receiver and method name a function for method `method` of type
+    /// `ty` ends its name with, generic arguments elided as the compiler
+    /// names instantiations (`[...]`).
+    fn method_suffix(ty: &str, method: &str) -> String {
+        let (pointer, base) = match ty.strip_prefix('*') {
+            Some(base) => (true, base),
+            None => (false, ty),
+        };
+        let base = elide_type_args(base);
+        let t = base.rsplit_once('.').map_or(base.as_str(), |(_, t)| t);
+        if pointer {
+            format!(".(*{t}).{method}")
+        } else {
+            format!(".{t}.{method}")
+        }
+    }
+
+    fn elide_type_args(name: &str) -> String {
+        let mut out = String::new();
+        let mut depth = 0usize;
+        for c in name.chars() {
+            match c {
+                '[' => {
+                    if depth == 0 {
+                        out.push_str("[...]");
+                    }
+                    depth += 1;
+                }
+                ']' => depth -= 1,
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Whether `function` can run method `method` of `ty`: named for it, or
+    /// for its pointer type when reached through an interface, or the
+    /// wrapper the linker shares among types embedding the same field at the
+    /// same place (`pkg..embed.<depth>.<offset>.<method's own name>`).
+    fn runs_method(function: &str, ty: &str, method: &str, via_pointer: bool) -> bool {
+        let name = elide_type_args(function);
+        let pointer = format!("*{}", ty.trim_start_matches('*'));
+        name.ends_with(&method_suffix(ty, method))
+            || (via_pointer && name.ends_with(&method_suffix(&pointer, method)))
+            || (name.contains("..embed.") && name.ends_with(&format!(".{method}")))
+    }
+
+    /// A type's methods resolve to the functions named for them: the direct
+    /// call to `pkg.T.M` or `pkg.(*T).M`, the interface call to that or the
+    /// pointer receiver's wrapper.
+    #[test]
+    fn methods_resolve_to_their_functions() {
+        let (mut direct, mut interface) = (0usize, 0usize);
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            for t in bin.all_types() {
+                for m in &t.methods {
+                    let at = format!("{}: {}.{}", fx.path, t.name, m.name);
+                    let functions = bin.method_functions(m);
+                    assert_eq!(
+                        functions.direct.is_some(),
+                        m.function_text_offset.is_some(),
+                        "{at}"
+                    );
+                    assert_eq!(
+                        functions.interface.is_some(),
+                        m.interface_text_offset.is_some(),
+                        "{at}"
+                    );
+                    if let Some(f) = functions.direct {
+                        assert!(
+                            runs_method(f.name, t.name, m.name, false),
+                            "{at}: {}",
+                            f.name
+                        );
+                        direct += 1;
+                    }
+                    if let Some(f) = functions.interface {
+                        assert!(
+                            runs_method(f.name, t.name, m.name, true),
+                            "{at}: {}",
+                            f.name
+                        );
+                        interface += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            direct > 15_000 && interface > 13_000,
+            "{direct} {interface}"
+        );
+    }
+
+    /// An itab binds each interface method to its concrete type's interface
+    /// entry for the method of the same name (its `ifn`): two tables the
+    /// linker writes apart. A method the linker dropped as unreachable has no
+    /// entry, and its itab word points at `runtime.unreachableMethod`.
+    #[test]
+    fn itab_methods_are_their_types_interface_entries() {
+        let mut checked = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            for pair in bin.itab_pairs() {
+                let Some(concrete) = bin.type_at(pair.concrete_type_va) else {
+                    continue;
+                };
+                for m in bin.itab_methods(&pair).into_iter().filter(|m| m.va != 0) {
+                    let at = format!("{}: {} {:?}", fx.path, concrete.name, m.name);
+                    let name = m.name.unwrap_or_else(|| panic!("{at}: unnamed"));
+                    let function = m.function.unwrap_or_else(|| panic!("{at}: {:#x}", m.va));
+                    let own = concrete.methods.iter().find(|c| c.name == name);
+                    match own.and_then(|c| c.interface_text_offset) {
+                        Some(off) => {
+                            assert_eq!(bin.text_addr(off as u32), Some(m.va), "{at}");
+                            assert!(
+                                runs_method(function.name, concrete.name, name, true),
+                                "{at}: {}",
+                                function.name
+                            );
+                        }
+                        None => assert_eq!(function.name, "runtime.unreachableMethod", "{at}"),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 3_000, "too few itab methods checked: {checked}");
+    }
+}
+
+mod attribution_and_symbols {
+    use super::matrix::{discover, tag_minor};
+    use super::*;
+    use gobin::{
+        SymbolKind,
+        detection::LayoutEvidence,
+        metadata::HookKind,
+        structures::{buildinfo, locate::ModuledataSource},
+    };
+
+    /// `has_cgo` is true for exactly the binaries built with cgo: the cgo
+    /// fixtures, not the ones whose runtime merely holds its own entry into C
+    /// (every binary from Go 1.7), its Windows callback entry, or Go 1.28's
+    /// C-compiler-free cgo bindings. A cgo binary's C-call stubs are hooks
+    /// named for the C functions its source calls.
+    #[test]
+    fn cgo_is_found_in_cgo_builds_only() {
+        let mut cgo = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            assert_eq!(bin.has_cgo(), fx.prog == "cgo", "{}", fx.path);
+            if fx.prog == "cgo" {
+                let stubs: BTreeSet<&str> = bin
+                    .runtime_hooks()
+                    .iter()
+                    .filter(|h| h.kind == HookKind::CgoCall)
+                    .map(|h| h.function.name)
+                    .collect();
+                // The source calls C.cgo_add and C.free (C.malloc goes
+                // through cgo's own allocator wrapper).
+                for stub in ["main._Cfunc_cgo_add", "main._Cfunc_free"] {
+                    assert!(stubs.contains(stub), "{}: {stubs:?}", fx.path);
+                }
+                cgo += 1;
+            }
+        }
+        assert_eq!(cgo, 3, "cgo fixtures checked");
+    }
+
+    /// The hooks of the basic program, which starts a goroutine, sends and
+    /// receives on a channel and closes one, are found in every release: the
+    /// entries the compiler lowers those statements to, each a function
+    /// entry.
+    #[test]
+    fn hooks_name_the_runtime_entries_of_go_statements() {
+        for fx in discover().into_iter().filter(|fx| fx.prog == "basic") {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let hooks = bin.runtime_hooks();
+            let kinds: BTreeSet<String> = hooks.iter().map(|h| format!("{:?}", h.kind)).collect();
+            for kind in [
+                "Spawn",
+                "ChanMake",
+                "ChanSend",
+                "ChanRecv",
+                "ChanClose",
+                "Panic",
+            ] {
+                assert!(kinds.contains(kind), "{}: no {kind} in {kinds:?}", fx.path);
+            }
+            for hook in &hooks {
+                assert_eq!(
+                    HookKind::of(hook.function.name),
+                    Some(hook.kind),
+                    "{}",
+                    fx.path
+                );
+                assert_eq!(
+                    bin.function_at(bin.entry_va(&hook.function).unwrap())
+                        .map(|f| f.func.entry_off),
+                    Some(hook.function.func.entry_off),
+                    "{}: {}",
+                    fx.path,
+                    hook.function.name
+                );
+            }
+        }
+    }
+
+    /// The experiments the version string ends with are the ones the build
+    /// info's `GOEXPERIMENT` setting records, read apart; and the scan for
+    /// the runtime's own copy of the version, used without build info, finds
+    /// the same.
+    #[test]
+    fn experiments_match_the_goexperiment_setting() {
+        let mut with = 0usize;
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let experiments = bin.go_experiments();
+            let setting: Vec<&str> = bin
+                .build_info()
+                .and_then(|info| info.setting("GOEXPERIMENT"))
+                .map_or_else(Vec::new, |s| s.split(',').collect());
+            assert_eq!(experiments, setting, "{}", fx.path);
+            let scanned: Vec<&str> = buildinfo::find_version_experiments(&data)
+                .map_or_else(Vec::new, |s| s.split(',').collect());
+            assert_eq!(scanned, experiments, "{}", fx.path);
+            // The deps builds turn two on, the cgo-bindings build one.
+            let expected = fx.prog == "deps" || fx.path.ends_with("_cgobindings");
+            assert_eq!(!experiments.is_empty(), expected, "{}", fx.path);
+            with += usize::from(expected);
+        }
+        assert!(with >= 2, "fixtures with experiments: {with}");
+        let data = load("tests/samples/deps_go128_linux_amd64");
+        let bin = GoBinary::parse(&data).unwrap();
+        assert_eq!(bin.go_experiments(), ["arenas", "nogreenteagc"]);
+    }
+
+    /// An untrimmed build names where it ran. The deps fixture was built in
+    /// `/home/gobin` with its GOROOT at `/usr/local/go` and a module from
+    /// the default cache; a trimmed build names nothing; and every untrimmed
+    /// Go 1.2-1.12 fixture names its GOROOT, the directory each runtime file
+    /// it records sits under.
+    #[test]
+    fn build_paths_name_where_the_build_ran() {
+        use gobin::metadata::BuildPaths;
+        let data = load("tests/samples/deps_go128_linux_amd64");
+        let bin = GoBinary::parse(&data).unwrap();
+        assert_eq!(
+            bin.build_paths(),
+            BuildPaths {
+                goroot: Some("/usr/local/go"),
+                module_cache: Some("/home/gobin/go/pkg/mod"),
+                gopath: Some("/home/gobin/go"),
+                main_dir: Some("/home/gobin/src/deps"),
+                home: Some("/home/gobin"),
+            }
+        );
+        for fx in discover().into_iter().filter(|fx| fx.prog != "deps") {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let paths = bin.build_paths();
+            if tag_minor(&fx.gotag) >= 13 {
+                assert_eq!(
+                    paths,
+                    BuildPaths::default(),
+                    "{}: built with -trimpath",
+                    fx.path
+                );
+                continue;
+            }
+            let goroot = paths
+                .goroot
+                .unwrap_or_else(|| panic!("{}: no GOROOT", fx.path));
+            let pcl = bin.pclntab().unwrap();
+            let runtime_files = pcl
+                .file_names()
+                .filter(|f| f.contains("/src/runtime/") || f.contains("/src/pkg/runtime/"))
+                .count();
+            assert!(runtime_files > 0, "{}", fx.path);
+            assert!(
+                pcl.file_names()
+                    .filter(|f| f.contains("/src/runtime/") || f.contains("/src/pkg/runtime/"))
+                    .all(|f| f.starts_with(goroot)),
+                "{}: {goroot}",
+                fx.path
+            );
+            assert_eq!(paths.module_cache, None, "{}", fx.path);
+        }
+    }
+
+    /// The symbol table, read from the container, names every function the
+    /// pclntab lists at its entry (assembly functions with Go 1.17's `.abi0`
+    /// suffix, generic instances with their type arguments where the pclntab
+    /// has `[...]`, and Go 1.17's `·` written `.`); on Mach-O and PE, which record no sizes, a function's
+    /// derived size is its extent in the function table. `runtime.text` is
+    /// `moduledata.text`, and `os.Args` is a zero-initialized global.
+    #[test]
+    fn symbols_agree_with_the_pclntab() {
+        // The linker names a generic function in the pclntab with everything
+        // from its first `[` to its last `]` cut to `[...]`
+        // (`cmd/link/internal/ld/pcln.go`, `funcNameForRuntime`), and Go 1.17
+        // writes `·` where the symbol table has `.`.
+        fn elide(name: &str) -> String {
+            let name = name.replace('\u{b7}', ".");
+            match (name.find('['), name.rfind(']')) {
+                (Some(open), Some(close)) if open < close => {
+                    format!("{}[...]{}", &name[..open], &name[close + 1..])
+                }
+                _ => name,
+            }
+        }
+        let (mut checked, mut sized, mut stripped) = (0usize, 0usize, 0usize);
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let symbols = bin.symbols();
+            let format = bin.context().format();
+            let present = bin
+                .report()
+                .signals
+                .contains(&ConfidenceSignal::SymbolTable);
+            assert_eq!(present, !symbols.is_empty(), "{}", fx.path);
+            if symbols.is_empty() {
+                if format != BinaryFormat::Wasm {
+                    assert!(fx.path.contains("_stripped"), "{}: no symbols", fx.path);
+                    stripped += 1;
+                }
+                continue;
+            }
+            let mut entries: Vec<u64> = bin.functions().filter_map(|f| bin.entry_va(&f)).collect();
+            entries.sort_unstable();
+            entries.dedup();
+            for f in bin.functions() {
+                let entry = bin.entry_va(&f).unwrap();
+                let at_entry: Vec<_> = symbols.iter().filter(|s| s.va == entry).collect();
+                let named = at_entry.iter().find(|s| {
+                    s.name == f.name
+                        || s.name.strip_suffix(".abi0") == Some(f.name)
+                        || elide(s.name) == elide(f.name)
+                });
+                let named = named.unwrap_or_else(|| {
+                    panic!("{}: {} at {entry:#x}: {at_entry:?}", fx.path, f.name)
+                });
+                assert_eq!(named.kind, SymbolKind::Text, "{}: {}", fx.path, f.name);
+                if !named.size_recorded
+                    && let Some(&next) = entries.iter().find(|&&e| e > entry)
+                {
+                    assert_eq!(named.size, next - entry, "{}: {}", fx.path, f.name);
+                    sized += 1;
+                }
+                checked += 1;
+            }
+            if let Some(md) = bin.moduledata() {
+                assert_eq!(
+                    symbols.named("runtime.text").map(|s| s.va),
+                    Some(md.text),
+                    "{}",
+                    fx.path
+                );
+            }
+            // A program that imports `os` (directly or through `fmt`) has it.
+            let Some(args) = symbols.named("os.Args") else {
+                assert_ne!(fx.prog, "basic", "{}: no os.Args", fx.path);
+                continue;
+            };
+            assert_eq!(args.kind, SymbolKind::Bss, "{}", fx.path);
+            assert_eq!(
+                symbols.at(args.va).map(|s| s.name),
+                Some("os.Args"),
+                "{}",
+                fx.path
+            );
+        }
+        assert!(checked > 100_000 && sized > 15_000, "{checked} {sized}");
+        assert!(stripped >= 8, "stripped fixtures: {stripped}");
+    }
+
+    /// The report states how the moduledata was found and the layouts the
+    /// records are read with, as the accessors give them.
+    #[test]
+    fn report_states_layouts_and_moduledata() {
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let signals = &bin.report().signals;
+            let located = signals.iter().find_map(|s| match s {
+                ConfidenceSignal::ModuledataLocated { version, source } => {
+                    Some((*version, *source))
+                }
+                _ => None,
+            });
+            match bin.moduledata() {
+                Some(md) => {
+                    let (version, source) = located.unwrap_or_else(|| panic!("{}", fx.path));
+                    assert_eq!(version, md.version, "{}", fx.path);
+                    // Its own section when the binary has one; else a scan, of
+                    // the data sections the linker emits it into, or of the
+                    // whole linear memory on wasm, whose sections are not
+                    // its address space.
+                    let expected = if bin.context().sections().go_module.is_some() {
+                        ModuledataSource::Section
+                    } else if bin.context().format() == BinaryFormat::Wasm {
+                        ModuledataSource::ImageScan
+                    } else {
+                        ModuledataSource::DataScan
+                    };
+                    assert_eq!(source, expected, "{}", fx.path);
+                }
+                None => {
+                    assert!(
+                        signals.contains(&ConfidenceSignal::ModuledataMissing),
+                        "{}",
+                        fx.path
+                    );
+                    assert!(tag_minor(&fx.gotag) <= 4, "{}: no moduledata", fx.path);
+                }
+            }
+            let layouts = signals
+                .iter()
+                .find_map(|s| match s {
+                    ConfidenceSignal::LayoutsChosen {
+                        itab,
+                        map,
+                        decided_by,
+                        ..
+                    } => Some((*itab, *map, *decided_by)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(layouts.0, bin.itab_layout(), "{}", fx.path);
+            assert_eq!(layouts.1, bin.map_layout(), "{}", fx.path);
+            let versioned = bin.go_version().is_some_and(|v| v.starts_with("go1."));
+            assert_eq!(
+                layouts.2 == LayoutEvidence::VersionString,
+                versioned,
+                "{}: {:?}",
+                fx.path,
+                bin.go_version()
+            );
+        }
+        // Go 1.2 records no version: its structure dates it to Go 1.2-1.4,
+        // which share the itab and map layouts.
+        let data = load("tests/samples/basic_go12_linux_amd64");
+        let bin = GoBinary::parse(&data).unwrap();
+        assert_eq!(
+            bin.itab_layout(),
+            gobin::structures::itab::ItabLayout::Linked
+        );
+        assert_eq!(
+            bin.map_layout(),
+            Some(gobin::structures::maptype::MapLayout::HmapWithHmapType)
+        );
+    }
+}
+
+mod coverage_metadata {
+    use super::matrix::discover;
+    use super::source_spans_and_methods::source_functions;
+    use super::*;
+    use gobin::{metadata::HookKind, structures::coverage::CoveragePackage};
+
+    /// The pclntab symbol of a function `cmd/cover` names `name` in a package
+    /// whose symbols start with `prefix`: `*T.M` is `prefix.(*T).M`.
+    fn symbol(prefix: &str, name: &str) -> String {
+        match name.strip_prefix('*') {
+            Some(method) => {
+                let (ty, m) = method.split_once('.').unwrap();
+                format!("{prefix}.(*{ty}).{m}")
+            }
+            None => format!("{prefix}.{name}"),
+        }
+    }
+
+    /// The fixture source and symbol prefix of an instrumented package.
+    fn source_of(prog: &str, package: &CoveragePackage<'_>) -> (String, &'static str) {
+        match (prog, package.package_name) {
+            ("deps", "greet") => ("tests/samples/src/greet/greet.go".into(), "greet"),
+            (prog, "main") => (format!("tests/samples/src/{prog}/main.go"), "main"),
+            other => panic!("unexpected package {other:?}"),
+        }
+    }
+
+    /// A `-cover` build's metadata describes its own source: each
+    /// instrumented function is in the pclntab under the symbol `cmd/cover`'s
+    /// name maps to, each of its units lies within that function in the
+    /// fixture's source file, and each file is the source's. The blob's
+    /// length is its symbol's recorded size, and the counter region holds a
+    /// counter variable for each function, `3 + units` words.
+    #[test]
+    fn coverage_describes_the_source() {
+        let (mut units, mut literals) = (0usize, 0usize);
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let packages = bin.coverage();
+            if !bin.is_coverage_build() || fx.path.contains("_stripped") {
+                assert!(packages.is_empty(), "{}", fx.path);
+                continue;
+            }
+            assert!(!packages.is_empty(), "{}", fx.path);
+            let names: BTreeSet<&str> = bin.functions().map(|f| f.name).collect();
+            let symbols = bin.symbols();
+            // The basic fixtures of Go 1.20-1.25 were built from a copy of
+            // the source three lines shorter; main.main's start line says.
+            let shift = bin
+                .functions()
+                .find(|f| f.name == "main.main")
+                .map_or(0, |f| f.func.start_line - 82);
+            let mut slots = 0usize;
+            for package in &packages {
+                let (source, prefix) = source_of(&fx.prog, package);
+                let declared = source_functions(&source, prefix);
+                let shift = if fx.prog == "basic" { shift } else { 0 };
+                let blob = symbols
+                    .iter()
+                    .find(|s| {
+                        s.name.contains(".goCover_")
+                            && s.name.ends_with("_M")
+                            && bin.coverage_meta_at(s.va).as_ref() == Some(package)
+                    })
+                    .unwrap();
+                assert_eq!(u64::from(package.length), blob.size, "{}", fx.path);
+                let base = source.rsplit('/').next().unwrap();
+                for file in package.files() {
+                    assert!(file.ends_with(&format!("/{base}")), "{}: {file}", fx.path);
+                }
+                for f in &package.functions {
+                    if f.is_literal {
+                        // A package-level function literal, named by where its
+                        // `func` keyword is: `func.L<line>.C<column>`.
+                        let (line, column) = f
+                            .name
+                            .strip_prefix("func.L")
+                            .and_then(|rest| rest.split_once(".C"))
+                            .map(|(l, c)| {
+                                (l.parse::<usize>().unwrap(), c.parse::<usize>().unwrap())
+                            })
+                            .unwrap_or_else(|| panic!("{}: literal {}", fx.path, f.name));
+                        let text = std::fs::read_to_string(&source).unwrap();
+                        let at = text.lines().nth(line - 1).unwrap();
+                        assert_eq!(
+                            at.get(column - 1..column + 3),
+                            Some("func"),
+                            "{}: {}",
+                            fx.path,
+                            f.name
+                        );
+                        for u in &f.units {
+                            assert!(u.start_line as usize >= line, "{}: {u:?}", fx.path);
+                            units += 1;
+                        }
+                        literals += 1;
+                        slots += f.counter_slots();
+                        continue;
+                    }
+                    let symbol = symbol(prefix, f.name);
+                    let pclntab = if package.package_name == "main" {
+                        symbol.clone()
+                    } else {
+                        format!(
+                            "{}{}",
+                            package.package_path,
+                            symbol.strip_prefix(prefix).unwrap()
+                        )
+                    };
+                    assert!(names.contains(pclntab.as_str()), "{}: {pclntab}", fx.path);
+                    let (_, first, close) = declared
+                        .iter()
+                        .find(|(s, ..)| *s == symbol)
+                        .unwrap_or_else(|| panic!("{}: {symbol} not in {source}", fx.path));
+                    for u in &f.units {
+                        let lines = (first + shift) as u32..=(close + shift) as u32;
+                        assert!(
+                            lines.contains(&u.start_line) && lines.contains(&u.end_line),
+                            "{}: {symbol} unit {u:?} outside {lines:?}",
+                            fx.path
+                        );
+                        assert!(u.statements > 0, "{}: {symbol}", fx.path);
+                        units += 1;
+                    }
+                    slots += f.counter_slots();
+                }
+            }
+            let region = bin.moduledata().unwrap().covctrs.unwrap();
+            let size = (region.end - region.start) as usize;
+            let vars: usize = packages.iter().map(|p| p.functions.len()).sum();
+            assert!(
+                slots * 4 <= size && size <= slots * 4 + 16 * (vars + 1),
+                "{}: {slots} slots in {size} bytes",
+                fx.path
+            );
+        }
+        assert!(units > 30, "too few units checked: {units}");
+        assert!(literals >= 1, "no function literal checked");
+    }
+
+    /// A stripped `-cover` build has no symbol to find its blobs by; decoded
+    /// from the addresses its unstripped twin's symbol table gives (where a
+    /// disassembler would read them off the registration calls), they are
+    /// the twin's. The registration hook is in exactly the `-cover` builds.
+    #[test]
+    fn stripped_coverage_decodes_from_the_registration_address() {
+        let full = load("tests/samples/deps_go128_linux_amd64_cover");
+        let full = GoBinary::parse(&full).unwrap();
+        let stripped = load("tests/samples/deps_go128_linux_amd64_cover_stripped");
+        let stripped = GoBinary::parse(&stripped).unwrap();
+        assert!(stripped.symbols().is_empty());
+        assert!(stripped.coverage().is_empty());
+        let expected = full.coverage();
+        assert_eq!(expected.len(), 2);
+        let decoded: Vec<_> = full
+            .symbols()
+            .iter()
+            .filter(|s| s.name.ends_with("_M") && s.name.contains(".goCover_"))
+            .map(|s| stripped.coverage_meta_at(s.va).unwrap())
+            .collect();
+        assert_eq!(decoded, expected);
+        // A wrong address decodes nothing.
+        let first = full
+            .symbols()
+            .iter()
+            .find(|s| s.name.ends_with("_M"))
+            .unwrap()
+            .va;
+        assert_eq!(stripped.coverage_meta_at(first + 4), None);
+
+        for fx in discover() {
+            let data = load(&fx.path);
+            let bin = GoBinary::parse(&data).unwrap();
+            let registers = bin
+                .runtime_hooks()
+                .iter()
+                .any(|h| h.kind == HookKind::CoverageRegistration);
+            assert_eq!(registers, bin.is_coverage_build(), "{}", fx.path);
+        }
+    }
+}
+
+mod universal {
+    use super::*;
+    use gobin::formats::{FatSlice, macho_slices};
+
+    const FAT: &str = "tests/samples/basic_go128_darwin_universal";
+    const THIN: [&str; 2] = [
+        "tests/samples/basic_go128_darwin_amd64",
+        "tests/samples/basic_go128_darwin_arm64",
+    ];
+
+    /// A universal file's slices are its thin images: each slice's bytes are
+    /// the file it was assembled from, and parse as that file does. Parsing
+    /// the universal file itself names the slices instead of reading one.
+    #[test]
+    fn universal_file_splits_into_its_images() {
+        use gobin::structures::Arch;
+        let fat = load(FAT);
+        let slices = macho_slices(&fat).unwrap();
+        let arches: Vec<Arch> = slices.iter().map(|s| s.arch).collect();
+        assert_eq!(arches, [Arch::X86_64, Arch::Arm64]);
+        for (slice, path) in slices.iter().zip(THIN) {
+            let thin = load(path);
+            assert_eq!(&fat[slice.range.clone()], &thin[..], "{path}");
+            let (a, b) = (
+                GoBinary::parse(&fat[slice.range.clone()]).unwrap(),
+                GoBinary::parse(&thin).unwrap(),
+            );
+            assert_eq!(a.arch(), slice.arch, "{path}");
+            assert_eq!(a.go_version(), b.go_version());
+            assert_eq!(a.build_id(), b.build_id());
+            assert_eq!(a.functions().count(), b.functions().count());
+            assert_eq!(a.types().count(), b.types().count());
+        }
+        match GoBinary::try_parse(&fat) {
+            Err(ParseError::Universal { slices: named }) => assert_eq!(named, slices),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        assert!(GoBinary::parse(&fat).is_none());
+    }
+
+    /// The 64-bit header (`0xcafebabf`: 64-bit offsets and sizes, 32-byte
+    /// entries) names the same slices.
+    #[test]
+    fn fat64_header_names_the_same_slices() {
+        let fat = load(FAT);
+        let slices = macho_slices(&fat).unwrap();
+        let mut wide = Vec::from(0xcafe_babf_u32.to_be_bytes());
+        wide.extend((slices.len() as u32).to_be_bytes());
+        let header = 8 + 32 * slices.len();
+        let base = slices[0].range.start; // the images keep their spacing
+        let shift = |at: usize| (at - base + header.next_multiple_of(1 << 14)) as u64;
+        for s in &slices {
+            wide.extend(s.cpu_type.to_be_bytes());
+            wide.extend(s.cpu_subtype.to_be_bytes());
+            wide.extend(shift(s.range.start).to_be_bytes());
+            wide.extend((s.range.len() as u64).to_be_bytes());
+            wide.extend([0, 0, 0, 14, 0, 0, 0, 0]);
+        }
+        wide.resize(header.next_multiple_of(1 << 14), 0);
+        wide.extend(&fat[base..]);
+        let named = macho_slices(&wide).unwrap();
+        for (a, b) in named.iter().zip(&slices) {
+            assert_eq!(&wide[a.range.clone()], &fat[b.range.clone()]);
+            assert_eq!(
+                (a.arch, a.cpu_type, a.cpu_subtype),
+                (b.arch, b.cpu_type, b.cpu_subtype)
+            );
+        }
+    }
+
+    /// No thin binary reads as universal, nor does a Java class file, which
+    /// shares the magic, nor a header whose slices leave the file or hold no
+    /// Mach-O image.
+    #[test]
+    fn only_universal_files_have_slices() {
+        for fx in super::matrix::discover() {
+            assert_eq!(macho_slices(&load(&fx.path)), None, "{}", fx.path);
+        }
+        // A class file: magic, minor 0, major 52 (Java 8), constant pool.
+        let class = [0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 52, 0, 0x1d, 0x0a, 0, 6];
+        assert_eq!(macho_slices(&class), None);
+        let fat = load(FAT);
+        let slices: Vec<FatSlice> = macho_slices(&fat).unwrap();
+        // A slice running past the end.
+        let mut cut = fat.clone();
+        cut.truncate(slices[1].range.end - 1);
+        assert_eq!(macho_slices(&cut), None);
+        // A slice whose bytes are no Mach-O image.
+        let mut moved = fat.clone();
+        moved[16..20].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(macho_slices(&moved), None);
+        // A slice count beyond the file.
+        let mut many = fat;
+        many[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(macho_slices(&many), None);
+    }
+}
+
+// ===========================================================================
+// A damaged section table: the moduledata found by scanning the whole image.
+// ===========================================================================
+mod damaged_sections {
+    use super::*;
+    use gobin::structures::locate::ModuledataSource;
+
+    /// The moduledata, text sections and function addresses of `bin`, for
+    /// comparing a damaged parse with the intact one.
+    fn layout(bin: &GoBinary<'_>) -> String {
+        let entries: Vec<_> = bin.functions().map(|f| bin.entry_va(&f)).collect();
+        format!(
+            "{:?}\n{:?}\n{entries:?}",
+            bin.moduledata(),
+            bin.text_sections()
+        )
+    }
+
+    /// Every ELF fixture with its section header offset (`e_shoff`) damaged
+    /// two ways: its low byte flipped (the fuzzer zeroed it, which leaves a
+    /// table whose offset already ends in zero intact) and the whole field
+    /// zeroed. Without sections the moduledata is found by scanning
+    /// the image from its start, which on a position-independent binary meets
+    /// `.rela.dyn` first: the relocation of the moduledata's `pcHeader` field
+    /// holds the pclntab address as its addend, among more
+    /// `(offset, R_X86_64_RELATIVE, addend)` triples that once passed as a
+    /// moduledata (`text` 0x594420 instead of 0x401000, a 5.8 million entry
+    /// `textsectmap`, every function address wrong and a 1.5 s
+    /// `functions()` pass). The scan must find the record the intact
+    /// section table names.
+    #[test]
+    fn image_scan_finds_the_moduledata_the_sections_name() {
+        let mut checked = 0;
+        let mut pie = false;
+        for fixture in matrix::discover() {
+            let data = load(&fixture.path);
+            // ELF only: ELFCLASS64 keeps e_shoff at 0x28 (8 bytes), ELFCLASS32
+            // at 0x20 (4 bytes).
+            let field = match data.get(..5) {
+                Some([0x7f, b'E', b'L', b'F', 2]) => 0x28..0x30,
+                Some([0x7f, b'E', b'L', b'F', 1]) => 0x20..0x24,
+                _ => continue,
+            };
+            let Some(intact) = GoBinary::parse(&data) else {
+                continue;
+            };
+            if intact.moduledata().is_none() {
+                continue;
+            }
+            let expected = layout(&intact);
+            for whole in [false, true] {
+                let mut damaged = data.clone();
+                if whole {
+                    damaged[field.clone()].fill(0);
+                } else {
+                    damaged[field.start] ^= 0xff;
+                }
+                let Some(bin) = GoBinary::parse(&damaged) else {
+                    panic!("{}: no parse with e_shoff damaged", fixture.path);
+                };
+                let source = bin.report().signals.iter().find_map(|s| match s {
+                    ConfidenceSignal::ModuledataLocated { source, .. } => Some(*source),
+                    _ => None,
+                });
+                assert!(
+                    matches!(
+                        source,
+                        Some(ModuledataSource::ImageScan | ModuledataSource::DataScan)
+                    ),
+                    "{}: the damaged binary must be scanned, not read from a section: {source:?}",
+                    fixture.path
+                );
+                assert_eq!(
+                    layout(&bin),
+                    expected,
+                    "{} (whole field: {whole})",
+                    fixture.path
+                );
+            }
+            pie |= fixture.path.ends_with("_pie");
+            checked += 1;
+        }
+        assert!(pie, "the position-independent fixture must be among them");
+        assert!(checked >= 50, "only {checked} ELF fixtures checked");
     }
 }

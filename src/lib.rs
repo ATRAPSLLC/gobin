@@ -78,31 +78,39 @@
 pub mod detection;
 pub mod formats;
 pub mod metadata;
+mod names;
 pub mod structures;
+mod symbols;
+mod util;
 
-use std::ops::Range;
+pub use symbols::{Symbol, SymbolKind, Symbols};
 
 use crate::{
     detection::{
-        Confidence, ConfidenceReport, ConfidenceSignal, ParseError, VersionSource, find_bytes,
+        Confidence, ConfidenceReport, ConfidenceSignal, LayoutEvidence, ParseError, VersionSource,
         heuristic_hits,
     },
     formats::{BinaryContext, BinaryFormat},
-    metadata::{BuildInfo, Compiler, FipsInfo, FunctionIter, InitFunc, InitTask, ObfuscationKind},
+    metadata::{
+        BuildInfo, Compiler, FipsInfo, FunctionInfo, FunctionIter, InitFunc, InitTask,
+        ObfuscationKind,
+    },
     structures::{
         Arch, PclntabVersion,
         bounds::BoundWord,
         buildid::{self, BuildId, BuildIdSource},
-        buildinfo, embed, gcprog,
+        buildinfo, coverage, embed, funcdata, gcprog,
         goslice::{GoSlice, GoStr},
         inittask, inline, itab,
         locate::{LocatedModuledata, ModuledataLocator},
-        moduledata::{LayoutHints, ModuleHash, Moduledata, ModuledataVersion, PtabEntry, TextSect},
+        moduledata::{
+            self, LayoutHints, ModuleHash, Moduledata, ModuledataVersion, PtabEntry, TextSect,
+        },
         name::decode_name,
-        pclntab::{self, FuncData, ParsedPclntab, PclntabMeta},
-        strings as gostrings, types,
-        util::read_i32,
+        pclntab::{self, LegacyFuncLayout, ParsedPclntab, PclntabMeta},
+        strings as gostrings, types, wasm,
     },
+    util::{find_bytes, read_i32, read_uintptr},
 };
 
 /// A parsed Go binary with all extractable metadata.
@@ -134,6 +142,18 @@ pub struct GoBinary<'a> {
     /// Offset of [`Self::moduledata`] in the address-space view
     /// ([`BinaryContext::structure_search_data`]).
     moduledata_offset: Option<usize>,
+    /// Whether a text offset names a function by its index rather than by
+    /// its PC offset: wasm from Go 1.25 on (see [`indexed_text_offsets`]).
+    indexed_text_offsets: bool,
+    /// Where this binary's itab records put their fields (see
+    /// [`choose_itab_layout`]).
+    itab_layout: itab::ItabLayout,
+    /// The Go minor versions the binary's tables can be from (see
+    /// [`minor_range`]).
+    minor_range: Option<MinorRange>,
+    /// `moduledata.textsectmap`, decoded once: every text address and offset
+    /// consults it.
+    text_sections: Vec<TextSect>,
 }
 
 impl<'a> GoBinary<'a> {
@@ -172,6 +192,9 @@ impl<'a> GoBinary<'a> {
     /// [`Self::report`] - useful for surfacing analyst-facing diagnostics
     /// (e.g. "Go binary, but pclntab missing - likely heavily patched").
     pub fn try_parse(data: &'a [u8]) -> Result<Self, ParseError> {
+        if let Some(slices) = formats::macho_slices(data) {
+            return Err(ParseError::Universal { slices });
+        }
         let ctx = BinaryContext::new(data);
         let mut report = ConfidenceReport::empty();
 
@@ -241,14 +264,16 @@ impl<'a> GoBinary<'a> {
         let (go_version, version_source): (Option<&'a str>, VersionSource) =
             match build_info_result.as_ref().and_then(|bi| bi.go_version) {
                 Some(v) => (Some(v), VersionSource::BuildInfoBlob),
-                None => (
-                    buildinfo::find_version_string(data),
-                    VersionSource::StringScan,
-                ),
+                None => match wasm::go_producer_version(data) {
+                    Some(v) => (Some(v), VersionSource::WasmProducers),
+                    None => (
+                        buildinfo::find_version_string(data),
+                        VersionSource::StringScan,
+                    ),
+                },
             };
-        if let Some(v) = go_version {
+        if go_version.is_some() {
             report.push(ConfidenceSignal::GoVersionString {
-                version: v.to_string(),
                 source: version_source,
             });
             report.raise_to(Confidence::Medium);
@@ -271,9 +296,33 @@ impl<'a> GoBinary<'a> {
             find_moduledata(&ctx, &pcl, go_version)
         });
         let moduledata_offset = located.as_ref().map(|found| found.offset);
+        let located_source = located
+            .as_ref()
+            .map(|found| (found.moduledata.version, found.source));
         let moduledata = located.map(|found| found.moduledata);
+        let indexed_text_offsets = indexed_text_offsets(&ctx, pclntab_meta);
+        let minor_range = minor_range(go_version, pclntab_meta.as_ref(), moduledata.as_ref());
+        let itab_layout = choose_itab_layout(&ctx, pclntab_meta, minor_range, moduledata.as_ref());
+        let pclntab_meta = pclntab_meta.map(|meta| PclntabMeta {
+            inline_index_pcdata: minor_range
+                .and_then(|range| range.decide(|m| funcdata::PcDataKind::InlTreeIndex.index(m)))
+                .flatten(),
+            ..meta
+        });
 
-        Ok(GoBinary {
+        match located_source {
+            Some((version, source)) => {
+                report.push(ConfidenceSignal::ModuledataLocated { version, source });
+            }
+            None => report.push(ConfidenceSignal::ModuledataMissing),
+        }
+        match (ctx.format(), ctx.has_symbols()) {
+            (BinaryFormat::Wasm | BinaryFormat::Unknown, _) => {}
+            (_, false) => report.push(ConfidenceSignal::SymbolTableStripped),
+            (_, true) => report.push(ConfidenceSignal::SymbolTable),
+        }
+
+        let mut bin = GoBinary {
             report,
             ctx,
             build_id,
@@ -282,7 +331,24 @@ impl<'a> GoBinary<'a> {
             go_version,
             moduledata,
             moduledata_offset,
-        })
+            indexed_text_offsets,
+            itab_layout,
+            minor_range,
+            text_sections: Vec::new(),
+        };
+        bin.text_sections = bin.decode_text_sections();
+        let layouts = ConfidenceSignal::LayoutsChosen {
+            itab: bin.itab_layout,
+            map: bin.map_layout(),
+            text_offsets_indexed: bin.indexed_text_offsets,
+            decided_by: if go_version.and_then(parse_go_minor_version).is_some() {
+                LayoutEvidence::VersionString
+            } else {
+                LayoutEvidence::Structure
+            },
+        };
+        bin.report.push(layouts);
+        Ok(bin)
     }
 
     /// The raw byte slice this analysis was built from.
@@ -317,6 +383,84 @@ impl<'a> GoBinary<'a> {
         self.go_version
     }
 
+    /// The `GOEXPERIMENT` experiments the toolchain was built or run with
+    /// that differ from its defaults, as Go records them after its version
+    /// (`go1.28 X:arenas,nogreenteagc`): an experiment turned on by name, one
+    /// turned off by `no` and its name. Empty when the build changed none.
+    ///
+    /// Read from the version the build info records, or without build info
+    /// from the runtime's own copy of its version string.
+    pub fn go_experiments(&self) -> Vec<&'a str> {
+        let list = match self.build_info.as_ref() {
+            Some(info) => info.go_version.and_then(buildinfo::version_experiments),
+            None => buildinfo::find_version_experiments(self.ctx.data()),
+        };
+        list.map_or_else(Vec::new, |list| list.split(',').collect())
+    }
+
+    /// Where the binary was built, read off the source paths its pclntab
+    /// records: GOROOT, the module cache, GOPATH, the main package's
+    /// directory and the home directory they are under. Empty for a build
+    /// with `-trimpath`, which records paths relative.
+    ///
+    /// Each root follows from where a package's import path places its
+    /// files, so no layout is assumed: the runtime under `<goroot>/src/`, a
+    /// module under `<cache>/<module>@<version>/`, a GOPATH-mode package
+    /// under `<gopath>/src/`.
+    pub fn build_paths(&self) -> metadata::BuildPaths<'_> {
+        let Some(pcl) = self.pclntab() else {
+            return metadata::BuildPaths::default();
+        };
+        // Each function's entry file. A function's name does not always place
+        // it (a linknamed `runtime.cmpstring` is in `internal/bytealg`, a
+        // generated one has no file of its own), so every function is offered
+        // and the roots are read off those whose file sits where their
+        // package's import path puts it.
+        let files = self.function_records().filter_map(|(name, func)| {
+            let (_, index) = pcl.decode_pcfile(&func).next()?;
+            Some((
+                names::package_of(name)?,
+                pcl.resolve_file_index(func.cu_offset, index)?,
+            ))
+        });
+        metadata::BuildPaths::from_files(files)
+    }
+
+    /// The container's symbol table (ELF `.symtab`, Mach-O `LC_SYMTAB`, PE
+    /// COFF symbols): the functions and globals the Go linker named, with
+    /// their addresses and sizes. Empty for a stripped (`-ldflags=-s`)
+    /// binary and for wasm. Read on each call; keep the result to look up
+    /// many addresses ([`symbols::Symbols::at`]).
+    pub fn symbols(&self) -> symbols::Symbols<'a> {
+        symbols::Symbols::read(self.ctx.data(), self.ctx.format())
+    }
+
+    /// The coverage metadata of a `-cover` build (Go 1.20+): each
+    /// instrumented package with its functions and their coverable units
+    /// ([`structures::coverage`]). Read from the blobs the symbol table names
+    /// (`<pkg>.goCover_<id>_M`), so empty for a stripped binary; there,
+    /// decode each blob from the address its package's registration call
+    /// passes ([`Self::coverage_meta_at`]).
+    pub fn coverage(&self) -> Vec<coverage::CoveragePackage<'_>> {
+        if !self.is_coverage_build() {
+            return Vec::new();
+        }
+        self.symbols()
+            .iter()
+            .filter(|s| s.name.contains(".goCover_") && s.name.ends_with("_M"))
+            .filter_map(|s| self.coverage_meta_at(s.va))
+            .collect()
+    }
+
+    /// The coverage metadata blob at `va`: the first argument of a
+    /// `runtime.addCovMeta` call ([`metadata::HookKind::CoverageRegistration`]),
+    /// for a disassembler working on a stripped `-cover` build. The result's
+    /// `length` and `hash` equal the call's second and third arguments when
+    /// `va` is right. `None` unless a well-formed blob starts at `va`.
+    pub fn coverage_meta_at(&self, va: u64) -> Option<coverage::CoveragePackage<'_>> {
+        coverage::CoveragePackage::parse(self.ctx.slice_at_va(va)?)
+    }
+
     /// The Go build ID.
     ///
     /// For executables this is a 4-part string: `actionID/actionID/contentID/contentID`,
@@ -327,22 +471,17 @@ impl<'a> GoBinary<'a> {
         self.build_id.as_ref().map(|build_id| build_id.id)
     }
 
-    /// File-offset extent of the raw build ID blob, from the first byte of the
-    /// opening marker `\xff Go build ID: "` through the last byte of the
-    /// closing marker `"\n \xff`.
-    ///
-    /// The blob is the `go:buildid` symbol the linker places at or near the
-    /// start of the text on Mach-O and PE, and the `go:buildid` custom section
-    /// of a wasm module. `None` when [`Self::build_id`] came from an ELF note
-    /// (where the Go linker puts it on ELF) or there is no build ID. The range
-    /// indexes [`BinaryContext::data`]; [`BinaryContext::file_to_va`] maps it
-    /// to the address space where the blob is loaded (a wasm custom section
+    /// Where the binary records its build ID ([`Self::build_id`]): the Go
+    /// build ID note on ELF, or a marker blob elsewhere, the `go:buildid`
+    /// symbol at or near the start of the text on Mach-O and PE and the
+    /// `go:buildid` custom section of a wasm module. A
+    /// [`BuildIdSource::Marker`]'s `blob` is its file-offset extent, from the
+    /// first byte of `\xff Go build ID: "` through the last of `"\n \xff`; it
+    /// indexes [`BinaryContext::data`], and [`BinaryContext::file_to_va`] maps
+    /// it to the address space where the blob is loaded (a wasm custom section
     /// is not).
-    pub fn build_id_blob(&self) -> Option<Range<usize>> {
-        match &self.build_id.as_ref()?.source {
-            BuildIdSource::Marker { blob } => Some(blob.clone()),
-            BuildIdSource::ElfNote => None,
-        }
+    pub fn build_id_source(&self) -> Option<&BuildIdSource> {
+        self.build_id.as_ref().map(|build_id| &build_id.source)
     }
 
     /// Build metadata including module path, dependencies, and build settings.
@@ -376,24 +515,175 @@ impl<'a> GoBinary<'a> {
         FunctionIter::new(self.pclntab())
     }
 
-    /// Streaming iterator over the per-PC inlining tree for a function.
+    /// Streaming iterator over the per-PC inlining tree for a function (Go
+    /// 1.9+).
     ///
     /// Yields one [`inline::InlineEntry`] per PC range during which an inlined
     /// frame is active. PC ranges with no inlining are skipped silently.
-    /// Returns an empty iterator when:
-    ///
-    /// - The function has no inlined calls (no `funcdata[FUNCDATA_InlTree]`).
-    /// - The binary has no recoverable pclntab.
-    /// - `moduledata.gofunc` is unavailable (Go 1.16-1.19 / V2 binaries do not
-    ///   expose this base, so funcdata cannot be resolved).
+    /// Empty when the function has no inlined calls, its Go version predates
+    /// the tree, or the binary has no recoverable pclntab. Each record is read
+    /// in its Go version's shape ([`inline::InlinedCallFormat`]).
     ///
     /// Source: `src/runtime/symtabinl.go` (`inlineUnwinder`).
-    pub fn inline_tree(&self, func: &FuncData) -> inline::InlineTreeIter<'_> {
-        let pcl = match self.pclntab() {
-            Some(p) => p,
-            None => return inline::InlineTreeIter::empty(),
+    pub fn inline_tree(&self, func: &FunctionInfo<'_>) -> inline::InlineTreeIter<'_> {
+        let (Some(pcl), Some(blob), Some(index)) = (
+            self.pclntab(),
+            self.funcdata_block(func, funcdata::FuncDataKind::InlTree),
+            self.pcdata(func, funcdata::PcDataKind::InlTreeIndex),
+        ) else {
+            return inline::InlineTreeIter::empty();
         };
-        inline::extract_iter(&self.ctx, pcl, self.moduledata.as_ref(), func)
+        let format = match pcl.version {
+            PclntabVersion::Go12 => match pcl.legacy_func {
+                Some(LegacyFuncLayout::DeferReturn) => inline::InlinedCallFormat::Go112,
+                _ => inline::InlinedCallFormat::Go19,
+            },
+            PclntabVersion::Go116 | PclntabVersion::Go118 => inline::InlinedCallFormat::Go112,
+            PclntabVersion::Go120 => inline::InlinedCallFormat::Go120,
+        };
+        inline::InlineTreeIter::new(pcl, func.func, format, blob, index.collect())
+    }
+
+    /// The function whose code holds address `pc`: the one a stack trace
+    /// would name for it, as the runtime's `findfunc` finds it.
+    ///
+    /// `pc` may be a function's entry or any address inside it (a return
+    /// address, a resume point on wasm). `None` when `pc` lies outside the
+    /// Go code or the binary has no recoverable pclntab.
+    pub fn function_at(&self, pc: u64) -> Option<FunctionInfo<'_>> {
+        let off = self.text_off(pc)?;
+        let pcl = self.pclntab()?;
+        let (_, func_off) = pcl.func_containing(off)?;
+        let func = pcl.parse_func(func_off)?;
+        Some(FunctionInfo::from_func(&pcl, func))
+    }
+
+    /// The address of `func`'s `kind` data block (`runtime.funcdata`), or
+    /// `None` when the function has none or the binary's Go version has no
+    /// such kind ([`funcdata::FuncDataKind::index`]).
+    ///
+    /// Go 1.18+ records a `u32` offset from `moduledata.gofunc` (`^0` for
+    /// none); through Go 1.17 a pointer, in a slot aligned to 8 bytes on
+    /// 64-bit targets (zero for none).
+    pub fn funcdata(&self, func: &FunctionInfo<'_>, kind: funcdata::FuncDataKind) -> Option<u64> {
+        let index = self.minor_range?.decide(|m| kind.index(m))??;
+        if index >= func.func.nfuncdata {
+            return None;
+        }
+        let pcl = self.pclntab()?;
+        match pcl.version {
+            PclntabVersion::Go118 | PclntabVersion::Go120 => {
+                let off = pcl.funcdata_at(&func.func, index)?;
+                if off == u32::MAX {
+                    return None;
+                }
+                self.moduledata
+                    .as_ref()?
+                    .gofunc?
+                    .checked_add(u64::from(off))
+            }
+            PclntabVersion::Go12 | PclntabVersion::Go116 => {
+                let ps = pcl.ptr_size;
+                let mut slot = pcl.offset.checked_add(pcl.funcdata_slots(&func.func)?)?;
+                let slot_va = self.ctx.view_to_va(slot)?;
+                if ps == 8 && slot_va & 4 != 0 {
+                    slot = slot.checked_add(4)?;
+                }
+                let at = slot.checked_add(usize::from(index).checked_mul(usize::from(ps))?)?;
+                let va = read_uintptr(self.ctx.structure_search_data(), at, ps)?;
+                (va != 0).then_some(va)
+            }
+        }
+    }
+
+    /// The bytes from `func`'s `kind` data block onward ([`Self::funcdata`]).
+    fn funcdata_block(
+        &self,
+        func: &FunctionInfo<'_>,
+        kind: funcdata::FuncDataKind,
+    ) -> Option<&[u8]> {
+        self.ctx.slice_at_va(self.funcdata(func, kind)?)
+    }
+
+    /// `func`'s `kind` per-PC table (`runtime.pcdatavalue`): `(pc_end,
+    /// value)` steps from the function's entry, as [`ParsedPclntab::decode_pcvalue`]
+    /// yields them. `None` when the function has none or the binary's Go
+    /// version has no such kind ([`funcdata::PcDataKind::index`]).
+    pub fn pcdata(
+        &self,
+        func: &FunctionInfo<'_>,
+        kind: funcdata::PcDataKind,
+    ) -> Option<pclntab::PcValueIter<'_>> {
+        let index = self.minor_range?.decide(|m| kind.index(m))??;
+        let pcl = self.pclntab()?;
+        let table = pcl.pcdata_at(&func.func, index)?;
+        (table != 0).then(|| pcl.decode_pcvalue(table))
+    }
+
+    /// For a wrapper, the function it wraps (`FUNCDATA_WrapInfo`, Go 1.18+):
+    /// what a method value, interface or `go`-statement wrapper calls, as
+    /// the runtime's execution tracer resolves it (`startPCForTrace`).
+    pub fn wrapped_function(&self, func: &FunctionInfo<'_>) -> Option<FunctionInfo<'_>> {
+        let block = self.funcdata_block(func, funcdata::FuncDataKind::WrapInfo)?;
+        let off = funcdata::parse_wrap_info(block)?;
+        self.function_at(self.text_addr(off)?)
+    }
+
+    /// `func`'s argument layout (`FUNCDATA_ArgInfo`, Go 1.17+): the
+    /// arguments a traceback prints, with their offsets and sizes.
+    pub fn arg_layout(&self, func: &FunctionInfo<'_>) -> Option<funcdata::ArgLayout> {
+        funcdata::ArgLayout::parse(self.funcdata_block(func, funcdata::FuncDataKind::ArgInfo)?)
+    }
+
+    /// Where `func`'s open-coded defers keep their state
+    /// (`FUNCDATA_OpenCodedDeferInfo`, Go 1.14+), in its Go version's format.
+    pub fn open_defers(&self, func: &FunctionInfo<'_>) -> Option<funcdata::OpenDefers> {
+        let block = self.funcdata_block(func, funcdata::FuncDataKind::OpenCodedDeferInfo)?;
+        // The format is that of the newest version in each of its eras.
+        let era = |m: u32| match m {
+            ..=17 => 17,
+            18..=21 => 21,
+            _ => 22,
+        };
+        funcdata::OpenDefers::parse(block, self.minor_range?.decide(era)?)
+    }
+
+    /// `func`'s stack objects (`FUNCDATA_StackObjects`, Go 1.12+): the
+    /// addressable locals and arguments its frame holds, with their type
+    /// (resolve [`funcdata::StackObject::type_va`] with [`Self::type_at`],
+    /// Go 1.12-1.16) or size and pointer layout (Go 1.17+).
+    pub fn stack_objects(&self, func: &FunctionInfo<'_>) -> Option<Vec<funcdata::StackObject>> {
+        let block = self.funcdata_block(func, funcdata::FuncDataKind::StackObjects)?;
+        let ps = self.pclntab_meta?.ptr_size;
+        let rodata = self.moduledata.as_ref().and_then(|m| m.rodata);
+        let era = |m: u32| match m {
+            ..=16 => 16,
+            17 => 17,
+            _ => 18,
+        };
+        funcdata::parse_stack_objects(block, ps, self.minor_range?.decide(era)?, rodata)
+    }
+
+    /// `func`'s GC pointer maps of its arguments (`kind` =
+    /// [`funcdata::FuncDataKind::ArgsPointerMaps`]) or locals
+    /// ([`funcdata::FuncDataKind::LocalsPointerMaps`]), borrowed from the
+    /// binary; [`funcdata::PcDataKind::StackMapIndex`] selects the map in
+    /// effect at a PC.
+    pub fn pointer_maps(
+        &self,
+        func: &FunctionInfo<'_>,
+        kind: funcdata::FuncDataKind,
+    ) -> Option<funcdata::PointerMaps<'_>> {
+        if !matches!(
+            kind,
+            funcdata::FuncDataKind::ArgsPointerMaps | funcdata::FuncDataKind::LocalsPointerMaps
+        ) {
+            return None;
+        }
+        let format = self
+            .minor_range?
+            .decide(funcdata::PointerMapFormat::for_go_minor)?;
+        funcdata::PointerMaps::parse(self.funcdata_block(func, kind)?, format)
     }
 
     /// The parsed moduledata, if discoverable.
@@ -450,7 +740,8 @@ impl<'a> GoBinary<'a> {
 
     /// Virtual address of `runtime.text` - the first byte of Go-emitted code.
     ///
-    /// `entry_off` on each [`FuncData`] is measured relative to this address.
+    /// A function's `entry_off` (in [`FunctionInfo::func`]) is measured
+    /// relative to this address.
     /// In most cases callers should reach for [`Self::entry_va`] /
     /// [`Self::entry_rva`] instead, which fold both the `text_va` lookup and
     /// the (PE-only) image-base translation into one accessor.
@@ -497,18 +788,75 @@ impl<'a> GoBinary<'a> {
             .filter(|&va| va != 0)
     }
 
-    /// Binary-level virtual address of a function's entry point.
+    /// The address of the code at text offset `off`: what the runtime's
+    /// `moduledata.textAddr` computes.
     ///
-    /// Folds together `text_va + func.entry_off` so callers don't reimplement
-    /// the translation. Returns `None` when [`Self::text_va`] is unavailable
-    /// (binary lacks moduledata or VA mapping) or the addition overflows.
+    /// A text offset is how Go's tables name code: a function's `entry_off`,
+    /// a method's `ifn`/`tfn`, the entries of the function table. The address
+    /// is [`Self::text_va`] plus the offset, with two refinements the runtime
+    /// makes:
+    ///
+    /// - When the linker split the code across several text sections, the
+    ///   section that holds `off` places it (`baseaddr + off - vaddr`).
+    /// - On wasm from Go 1.25 on, code is not in linear memory and a text
+    ///   offset is a function's index while a PC is `text + (index << 16) +
+    ///   resume_point`. The result is that PC, the value an itab, a `func`
+    ///   value or an init task holds for the function. The runtime computes
+    ///   it as `(text + off) << 16` with `text` at `0` in Go 1.25-1.27, and as
+    ///   `text + (off << 16)` with `text` at `1 << 63` from Go 1.28, which
+    ///   agree. Before Go 1.25 a wasm text offset is a PC offset like any
+    ///   other.
+    ///
+    /// `None` when [`Self::text_va`] is unavailable or the address overflows.
+    pub fn text_addr(&self, off: u32) -> Option<u64> {
+        moduledata::text_addr(
+            self.text_va()?,
+            self.split_text_sections(),
+            off,
+            self.indexed_text_offsets,
+        )
+    }
+
+    /// The text offset of the code at address `pc`: what the runtime's
+    /// `moduledata.textOff` computes, the inverse of [`Self::text_addr`].
+    ///
+    /// On wasm a PC inside a function (a resume point) yields that function's
+    /// offset, as the runtime's does. `None` when [`Self::text_va`] is
+    /// unavailable, `pc` lies before the code or in no text section, or the
+    /// offset does not fit the 32 bits Go's tables give it.
+    pub fn text_off(&self, pc: u64) -> Option<u32> {
+        moduledata::text_off(
+            self.text_va()?,
+            self.split_text_sections(),
+            pc,
+            self.indexed_text_offsets,
+        )
+    }
+
+    /// The text sections, when the linker split the code across more than
+    /// one: the only case in which a text offset is not simply added to
+    /// `runtime.text`. Empty otherwise, without decoding the table.
+    fn split_text_sections(&self) -> &[TextSect] {
+        match self.moduledata.as_ref() {
+            Some(md) if md.textsectmap.len > 1 => &self.text_sections,
+            _ => &[],
+        }
+    }
+
+    /// Binary-level virtual address of a function's entry point: the
+    /// [`Self::text_addr`] of its `entry_off`.
+    ///
+    /// Returns `None` when [`Self::text_va`] is unavailable (binary lacks
+    /// moduledata or VA mapping) or the address overflows.
     ///
     /// For ELF and Mach-O this is the address a disassembler will use
     /// directly. For PE this is still a true VA - pass it to
     /// [`Self::entry_rva`] (or subtract [`BinaryContext::image_base`]) to get
-    /// the RVA most PE-aware tools expect.
-    pub fn entry_va(&self, func: &FuncData) -> Option<u64> {
-        self.text_va()?.checked_add(u64::from(func.entry_off))
+    /// the RVA most PE-aware tools expect. For wasm it is the function's
+    /// runtime PC, the value code pointers to it hold (see
+    /// [`Self::text_addr`]), not a byte position in the Code section.
+    pub fn entry_va(&self, func: &FunctionInfo<'_>) -> Option<u64> {
+        self.text_addr(func.func.entry_off)
     }
 
     /// Image-base-relative entry RVA.
@@ -519,7 +867,7 @@ impl<'a> GoBinary<'a> {
     ///
     /// Returns `None` when [`Self::entry_va`] is unavailable or the binary's
     /// `text_va` lies below the recorded image base (corrupt input).
-    pub fn entry_rva(&self, func: &FuncData) -> Option<u64> {
+    pub fn entry_rva(&self, func: &FunctionInfo<'_>) -> Option<u64> {
         self.entry_va(func)?.checked_sub(self.ctx.image_base())
     }
 
@@ -527,7 +875,9 @@ impl<'a> GoBinary<'a> {
     /// Go-emitted code.
     ///
     /// `etext_va() - text_va()` gives the total size of all Go-emitted code,
-    /// useful as an "amount of Go code in this binary" metric.
+    /// useful as an "amount of Go code in this binary" metric - except on
+    /// wasm, where both are PCs (see [`Self::text_addr`]) and the difference
+    /// counts functions in units of `1 << 16`.
     pub fn etext_va(&self) -> Option<u64> {
         self.moduledata.as_ref().map(|m| m.etext)
     }
@@ -547,7 +897,7 @@ impl<'a> GoBinary<'a> {
     /// no section holds that byte.
     pub fn text_section_end_va(&self) -> Option<u64> {
         let etext = self.etext_va()?;
-        self.text_sections()
+        self.text_sections
             .iter()
             .filter_map(TextSect::va_range)
             .find(|range| range.start < etext && etext <= range.end)
@@ -588,7 +938,7 @@ impl<'a> GoBinary<'a> {
                 .moduledata_offset
                 .and_then(|offset| self.ctx.view_to_va(offset))
         {
-            words.extend(md.bound_words(va, ps, &self.text_sections()));
+            words.extend(md.bound_words(va, ps, &self.text_sections));
         }
         words.sort_unstable_by_key(|word| word.va);
         words
@@ -679,6 +1029,11 @@ impl<'a> GoBinary<'a> {
     /// ordinary binary; multiple only when the linker split a large binary's
     /// code across several text sections.
     pub fn text_sections(&self) -> Vec<TextSect> {
+        self.text_sections.clone()
+    }
+
+    /// Decode `moduledata.textsectmap` (see [`Self::text_sections`]).
+    fn decode_text_sections(&self) -> Vec<TextSect> {
         let md = match self.moduledata.as_ref() {
             Some(m) => m,
             None => return Vec::new(),
@@ -867,13 +1222,14 @@ impl<'a> GoBinary<'a> {
         }
 
         let mut user_pkgs = std::collections::BTreeSet::new();
-        for f in self.functions() {
-            if f.is_runtime() || f.is_internal() {
+        for (name, _) in self.function_records() {
+            let Some(pkg) = names::package_of(name) else {
+                continue;
+            };
+            if name.starts_with("runtime.") || metadata::is_internal_path(pkg) {
                 continue;
             }
-            if let Some(pkg) = f.package() {
-                user_pkgs.insert(pkg.to_string());
-            }
+            user_pkgs.insert(pkg);
         }
         if user_pkgs.is_empty() {
             return ObfuscationKind::None;
@@ -906,7 +1262,9 @@ impl<'a> GoBinary<'a> {
     }
 
     /// The Go internal commit hash, if the binary was built from a development
-    /// toolchain (e.g. `"devel go1.23-abc1234 ..."`).
+    /// toolchain: `2dbf8b413a` in `"go1.28-devel_2dbf8b413a Fri Nov 20 ..."`
+    /// (the form `cmd/dist` writes since the Go 1.25 cycle) or `abc1234` in
+    /// `"devel go1.23-abc1234 ..."` (the form before).
     ///
     /// Returns `None` for released-version binaries (`"go1.22.3"`), where the
     /// commit hash is not stamped into the version string.
@@ -915,25 +1273,7 @@ impl<'a> GoBinary<'a> {
     /// more precise than the marketing version - released versions only narrow
     /// to a tag.
     pub fn runtime_commit(&self) -> Option<&str> {
-        let v = self.go_version?;
-        let bytes = v.as_bytes();
-        let mut i: usize = 0;
-        while let Some(&byte) = bytes.get(i) {
-            if byte == b'-' {
-                let start = i.checked_add(1)?;
-                let mut end = start;
-                while bytes.get(end).is_some_and(|b| b.is_ascii_hexdigit()) {
-                    end = end.checked_add(1)?;
-                }
-                if end.checked_sub(start)? >= 7 {
-                    return v.get(start..end);
-                }
-                i = end;
-            } else {
-                i = i.checked_add(1)?;
-            }
-        }
-        None
+        toolchain_commit(self.go_version?)
     }
 
     /// FIPS-140 build info, if the binary was compiled in FIPS mode
@@ -1025,14 +1365,10 @@ impl<'a> GoBinary<'a> {
         // away. It also walks `func_entries` rather than `functions()`, which
         // would additionally decode a source file, line range and frame size
         // for every function in the binary.
-        let text_va = self.text_va();
-        let entry_off_of =
-            |pc_va: u64| -> Option<u32> { u32::try_from(pc_va.checked_sub(text_va?)?).ok() };
-
         let mut wanted: Vec<u32> = raw
             .iter()
             .flatten()
-            .filter_map(|pc| entry_off_of(*pc))
+            .filter_map(|&pc| self.text_off(pc))
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
@@ -1055,7 +1391,7 @@ impl<'a> GoBinary<'a> {
         }
 
         let resolve = |pc_va: u64| -> Option<&str> {
-            let off = entry_off_of(pc_va)?;
+            let off = self.text_off(pc_va)?;
             names
                 .binary_search_by_key(&off, |(o, _)| *o)
                 .ok()
@@ -1075,7 +1411,7 @@ impl<'a> GoBinary<'a> {
                 let package = functions
                     .iter()
                     .find_map(|f| f.name)
-                    .and_then(metadata::package_of);
+                    .and_then(names::package_of);
                 InitTask { package, functions }
             })
             .collect()
@@ -1092,39 +1428,108 @@ impl<'a> GoBinary<'a> {
     /// pair with [`Self::types`] to resolve each VA back to a named type.
     pub fn itab_pairs(&self) -> itab::ItabIter<'_> {
         let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
-        itab::extract_iter(&self.ctx, ptr_size, self.moduledata.as_ref())
+        itab::extract_iter(
+            &self.ctx,
+            ptr_size,
+            self.moduledata.as_ref(),
+            self.itab_layout,
+        )
     }
 
-    /// The `Fun[]` method-pointer array of an itab - the concrete-type methods
-    /// bound to each interface method, in interface order (a `0` entry means
-    /// the method is unbound). Pair with [`Self::itab_pairs`].
-    pub fn itab_methods(&self, pair: &itab::ItabPair) -> Vec<u64> {
+    /// The methods of an itab (see [`Self::itab_pairs`]): for each interface
+    /// method, in interface order, its name and the concrete method its
+    /// `Fun` word binds it to, resolved to that function.
+    pub fn itab_methods(&self, pair: &itab::ItabPair) -> Vec<itab::ItabMethod<'_>> {
         let ptr_size = self.pclntab_meta.map(|m| m.ptr_size).unwrap_or(0);
-        itab::itab_methods(&self.ctx, pair, ptr_size)
+        let names: Vec<&str> = match self.type_at(pair.iface_type_va).map(|t| t.detail) {
+            Some(types::TypeDetail::Interface { methods, .. }) => {
+                methods.into_iter().map(|m| m.name).collect()
+            }
+            _ => Vec::new(),
+        };
+        itab::itab_methods(&self.ctx, pair, ptr_size, self.itab_layout)
+            .into_iter()
+            .enumerate()
+            .map(|(i, va)| itab::ItabMethod {
+                name: names.get(i).copied(),
+                va,
+                function: self
+                    .text_off(va)
+                    .and_then(|off| self.function_entered_at(off)),
+            })
+            .collect()
     }
 
-    /// Whether the binary's pclntab references any cgo-related runtime
-    /// functions (`runtime.cgocall`, `runtime.cgocallback`, etc.).
-    ///
-    /// This is a binary-level "did this binary use cgo at all?" signal - a
-    /// strong indicator the program may execute native code from C (DLLs,
-    /// syscalls, exploits). Per-call-site enumeration would require
-    /// disassembly support, which the crate does not have today.
+    /// The functions a concrete type's method (a [`types::MethodEntry`] of
+    /// [`types::GoType::methods`]) runs when called directly and through an
+    /// interface.
+    pub fn method_functions(&self, method: &types::MethodEntry<'_>) -> types::MethodFunctions<'_> {
+        let resolve = |off: Option<i32>| {
+            off.and_then(|off| u32::try_from(off).ok())
+                .and_then(|off| self.function_entered_at(off))
+        };
+        types::MethodFunctions {
+            direct: resolve(method.function_text_offset),
+            interface: resolve(method.interface_text_offset),
+        }
+    }
+
+    /// The function whose entry is text offset `off`: what a method's
+    /// `tfn`/`ifn` or an itab word names. `None` when `off` lies inside a
+    /// function rather than at its start, which no code pointer does.
+    fn function_entered_at(&self, off: u32) -> Option<FunctionInfo<'_>> {
+        self.function_at(self.text_addr(off)?)
+            .filter(|f| f.func.entry_off == off)
+    }
+
+    /// Where this binary's itab records put their `hash` and method words,
+    /// which Go changed three times (see [`itab::ItabLayout`]).
+    pub fn itab_layout(&self) -> itab::ItabLayout {
+        self.itab_layout
+    }
+
+    /// Whether the binary links cgo (`runtime/cgo`): it holds a function only
+    /// such a binary has, a stub cgo generates to call a C function
+    /// (`pkg._Cfunc_<name>`), the runtime's exports to the C side
+    /// (`_cgo_panic`, `_cgo_topofstack`) or its cgo pointer check. The
+    /// runtime's own entry into C (`runtime.cgocall`) is in every binary
+    /// from Go 1.7, with or without cgo, so it is no evidence.
     pub fn has_cgo(&self) -> bool {
-        // Short-circuits on the first matching function via the streaming
-        // iterator - does not materialize the whole function list.
-        self.functions().any(|f| is_cgo_runtime_fn(f.name))
+        self.function_records()
+            .any(|(name, _)| names::is_cgo_marker(name))
     }
 
-    /// Whether the binary references Go concurrency primitives
-    /// (`runtime.newproc`, channel send/recv, select).
+    /// The runtime and `syscall` functions the compiler lowers goroutine,
+    /// channel, `select`, `defer`, `panic`, cgo and system-call operations to
+    /// ([`metadata::HookKind`]), as found in this binary.
     ///
-    /// Like [`Self::has_cgo`], this is a binary-level signal. A binary that
-    /// imports `sync` but never calls `go` may still trigger this if the
-    /// stdlib internally spawns goroutines. Short-circuits on the first
-    /// matching function.
-    pub fn uses_concurrency(&self) -> bool {
-        self.functions().any(|f| is_concurrency_runtime_fn(f.name))
+    /// The runtime itself starts goroutines and uses channels, so most of
+    /// these functions are in every binary; what marks a program's own use
+    /// of an operation is a call to one, which a disassembler finds by
+    /// matching call targets against these entries.
+    pub fn runtime_hooks(&self) -> Vec<metadata::RuntimeHook<'_>> {
+        let Some(pcl) = self.pclntab() else {
+            return Vec::new();
+        };
+        self.function_records()
+            .filter_map(|(name, func)| {
+                Some(metadata::RuntimeHook {
+                    kind: metadata::HookKind::of(name)?,
+                    function: FunctionInfo::from_func(&pcl, func),
+                })
+            })
+            .collect()
+    }
+
+    /// Every function's name with its record, without decoding its tables
+    /// as [`Self::functions`] does: for checks that need only names.
+    fn function_records(&self) -> impl Iterator<Item = (&str, pclntab::FuncData)> + '_ {
+        self.pclntab().into_iter().flat_map(|pcl| {
+            pcl.func_entries().filter_map(move |(_, off)| {
+                let func = pcl.parse_func(off)?;
+                Some((pcl.func_name(func.name_off as u32)?, func))
+            })
+        })
     }
 
     /// Streaming iterator over all types extracted from Go `abi.Type` descriptors.
@@ -1212,17 +1617,37 @@ impl<'a> GoBinary<'a> {
 
     /// [`Self::type_abi`] with the name encoding `legacy_names` states.
     fn type_abi_with(&self, meta: PclntabMeta, legacy_names: bool) -> types::TypeAbi {
-        let md_version = self.moduledata.as_ref().map(|m| m.version);
         types::TypeAbi {
             ps: meta.ptr_size,
             legacy_names,
-            map_layout: types::MapLayout::infer(
-                self.go_version().and_then(parse_go_minor_version),
-                meta.version == PclntabVersion::Go120,
-                md_version == Some(ModuledataVersion::V5),
-                md_version == Some(ModuledataVersion::V4),
-            ),
+            map_layout: self.map_layout_for(meta),
         }
+    }
+
+    /// The `abi.MapType` layout of the binary's Go version: the one every
+    /// version its tables can be from shares, else what
+    /// [`types::MapLayout::infer`] reads off the structure, which may be
+    /// [`types::MapLayout::Probe`] (decided per map type descriptor). `None`
+    /// without a pclntab.
+    pub fn map_layout(&self) -> Option<types::MapLayout> {
+        Some(self.map_layout_for(self.pclntab_meta?))
+    }
+
+    /// [`Self::map_layout`] for the pclntab `meta` describes.
+    fn map_layout_for(&self, meta: PclntabMeta) -> types::MapLayout {
+        if let Some(layout) = self
+            .minor_range
+            .and_then(|range| range.decide(types::MapLayout::for_go_minor))
+        {
+            return layout;
+        }
+        let md_version = self.moduledata.as_ref().map(|m| m.version);
+        types::MapLayout::infer(
+            None,
+            meta.version == PclntabVersion::Go120,
+            md_version == Some(ModuledataVersion::V5),
+            md_version == Some(ModuledataVersion::V4),
+        )
     }
 
     /// Streaming iterator over Go string literals discovered by scanning the
@@ -1301,42 +1726,6 @@ pub fn detect(data: &[u8]) -> bool {
     false
 }
 
-/// Runtime function names indicating cgo usage.
-///
-/// Source: `src/runtime/cgo.go`, `src/runtime/cgocall.go`,
-/// `src/runtime/cgocallback.go`.
-const CGO_RUNTIME_FNS: &[&str] = &[
-    "runtime.cgocall",
-    "runtime.cgocallback",
-    "runtime.cgocall_native",
-    "runtime.asmcgocall",
-    "runtime.cgoCheckPointer",
-    "runtime._cgo_panic",
-];
-
-/// Runtime function names indicating goroutine / channel use.
-///
-/// Source: `src/runtime/proc.go` (newproc), `src/runtime/chan.go`
-/// (chan{send,recv,close,recv1,recv2}), `src/runtime/select.go`.
-const CONCURRENCY_RUNTIME_FNS: &[&str] = &[
-    "runtime.newproc",
-    "runtime.chansend",
-    "runtime.chansend1",
-    "runtime.chanrecv",
-    "runtime.chanrecv1",
-    "runtime.chanrecv2",
-    "runtime.closechan",
-    "runtime.selectgo",
-];
-
-fn is_cgo_runtime_fn(name: &str) -> bool {
-    CGO_RUNTIME_FNS.contains(&name)
-}
-
-fn is_concurrency_runtime_fn(name: &str) -> bool {
-    CONCURRENCY_RUNTIME_FNS.contains(&name)
-}
-
 /// Whether `pkg` looks like a garble-emitted obfuscated package token: 8-16
 /// characters of `[A-Za-z0-9_]` with no `/` (path) separators and at least
 /// one digit (real Go package names rarely contain digits).
@@ -1401,7 +1790,42 @@ fn decode_slice<T>(
     out
 }
 
+/// The commit hash a development toolchain's version string names: the hex
+/// run after `-devel_` (`go1.28-devel_2dbf8b413a ...`, since the Go 1.25
+/// cycle) or after the `-` of `devel go1.23-abc1234 ...` (before). At least
+/// seven hex digits, as `git log --format=%h` abbreviates. See
+/// [`GoBinary::runtime_commit`].
+fn toolchain_commit(v: &str) -> Option<&str> {
+    let bytes = v.as_bytes();
+    let mut i: usize = 0;
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'-' {
+            let mut start = i.checked_add(1)?;
+            if v.get(start..)
+                .is_some_and(|rest| rest.starts_with("devel_"))
+            {
+                start = start.checked_add("devel_".len())?;
+            }
+            let mut end = start;
+            while bytes.get(end).is_some_and(|b| b.is_ascii_hexdigit()) {
+                end = end.checked_add(1)?;
+            }
+            if end.checked_sub(start)? >= 7 {
+                return v.get(start..end);
+            }
+            i = end;
+        } else {
+            i = i.checked_add(1)?;
+        }
+    }
+    None
+}
+
+/// The minor version a Go version string names (`go1.27.4` -> 27), in every
+/// form the toolchain writes: release, pre-release, and both development forms.
 fn parse_go_minor_version(version: &str) -> Option<u32> {
+    // A development toolchain before the Go 1.25 cycle wrote `devel go1.N-...`.
+    let version = version.strip_prefix("devel ").unwrap_or(version);
     let rest = version.strip_prefix("go1.")?;
     // Take the leading run of digits so pre-release strings parse too:
     // `go1.27.4` -> 27, `go1.27rc1` -> 27, `go1.27-devel_abc1234` -> 27.
@@ -1429,6 +1853,126 @@ fn find_moduledata(
     ModuledataLocator::new(ctx, pclntab.ptr_size, pclntab.offset, hints).locate()
 }
 
+/// The itab layout a binary uses: the one every Go version its tables can be
+/// from emits ([`MinorRange`]), or where they differ, the one its structure
+/// shows.
+///
+/// Without a version a Go 1.5-1.15 moduledata reads as the richest shape of
+/// its era (Go 1.10-1.15, as [`Moduledata::parse`] assumes), so `Padded`. A
+/// later binary is `Padded` (1.10-1.22) or `Abi` (1.23+), which differ only
+/// on 32-bit, where the first record tells them apart: the word after `hash`
+/// is the zero padding of `Padded` or `fun[0]` of `Abi`, which the linker
+/// fills in every itab it emits from Go 1.10 on.
+fn choose_itab_layout(
+    ctx: &BinaryContext<'_>,
+    meta: Option<PclntabMeta>,
+    minor_range: Option<MinorRange>,
+    moduledata: Option<&Moduledata>,
+) -> itab::ItabLayout {
+    if let Some(layout) = minor_range.and_then(|range| range.decide(itab::ItabLayout::for_go_minor))
+    {
+        return layout;
+    }
+    if moduledata.is_some_and(|md| md.version == ModuledataVersion::V1) {
+        return itab::ItabLayout::Padded;
+    }
+    let ptr_size = meta.map_or(0, |m| m.ptr_size);
+    if ptr_size != 4 {
+        return itab::ItabLayout::Abi;
+    }
+    let first = itab::extract_iter(ctx, ptr_size, moduledata, itab::ItabLayout::Abi).next();
+    let after_hash = first.and_then(|pair| {
+        let bytes = ctx.slice_at_va(pair.itab_va.checked_add(12)?)?;
+        Some(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))
+    });
+    match after_hash {
+        Some(0) => itab::ItabLayout::Padded,
+        _ => itab::ItabLayout::Abi,
+    }
+}
+
+/// Whether the binary's text offsets name functions by index: wasm
+/// (`GOARCH=wasm`, 8-byte pointers) from Go 1.25 on.
+///
+/// The Go 1.25 linker (`cmd/link/internal/ld/pcln.go`, `textOff`; Go commit
+/// `9c507e7942`) writes a wasm function's index into the function table and
+/// the method tables, where it used to write the function's PC offset; the
+/// runtime's `textAddr` shifts it into a PC. The table itself says which:
+/// consecutive functions' PCs are at least `1 << 16` apart (a PC's low 16 bits
+/// number resume points inside a function), while their indices step by one.
+/// The `wasm32` port (4-byte pointers) does not index.
+fn indexed_text_offsets(ctx: &BinaryContext<'_>, meta: Option<PclntabMeta>) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    if ctx.format() != BinaryFormat::Wasm || meta.ptr_size != 8 {
+        return false;
+    }
+    let Some(pcl) = meta.attach(ctx.structure_search_data()) else {
+        return false;
+    };
+    let mut entries = pcl.func_entries().map(|(entry_off, _)| entry_off);
+    match (entries.next(), entries.next()) {
+        (Some(first), Some(second)) => second.checked_sub(first).is_some_and(|step| step < 1 << 16),
+        _ => false,
+    }
+}
+
+/// The Go minor versions a binary's tables can be from: its version string's
+/// when it states one, else the range its structure allows (the pclntab
+/// format, the Go 1.2-1.15 `_func` layout, the moduledata layout).
+fn minor_range(
+    go_version: Option<&str>,
+    pclntab: Option<&PclntabMeta>,
+    moduledata: Option<&Moduledata>,
+) -> Option<MinorRange> {
+    if let Some(minor) = go_version.and_then(parse_go_minor_version) {
+        return Some(MinorRange {
+            lo: minor,
+            hi: minor,
+        });
+    }
+    let (lo, hi) = match pclntab?.version {
+        PclntabVersion::Go12 => match pclntab?.legacy_func {
+            Some(LegacyFuncLayout::FrameSize) => (2, 4),
+            Some(LegacyFuncLayout::FramePlaceholder) => (5, 9),
+            Some(LegacyFuncLayout::FuncIdWord) => (10, 11),
+            _ => (12, 15),
+        },
+        PclntabVersion::Go116 => (16, 17),
+        PclntabVersion::Go118 => (18, 19),
+        PclntabVersion::Go120 => match moduledata.map(|m| m.version) {
+            Some(ModuledataVersion::V3) => (20, 25),
+            Some(ModuledataVersion::V4) => (26, 26),
+            _ => (27, MinorRange::NEWEST),
+        },
+    };
+    Some(MinorRange { lo, hi })
+}
+
+/// The Go minor versions a binary's tables can be from, inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MinorRange {
+    /// The oldest.
+    lo: u32,
+    /// The newest; [`Self::NEWEST`] when no newer layout bounds it.
+    hi: u32,
+}
+
+impl MinorRange {
+    /// A bound past every Go version this crate knows the layouts of, which
+    /// later versions are assumed to share with the newest it knows.
+    const NEWEST: u32 = 40;
+
+    /// What `f` gives for every version in the range, if it gives the same
+    /// for all of them; `None` when the versions disagree, so a format the
+    /// structure cannot pin down is not guessed.
+    fn decide<T: PartialEq>(self, f: impl Fn(u32) -> T) -> Option<T> {
+        let first = f(self.lo);
+        (self.lo..=self.hi).all(|m| f(m) == first).then_some(first)
+    }
+}
+
 /// Collect the out-of-band signals [`Moduledata::parse`] uses to pick between
 /// the V5 (Go 1.27+) and pre-V5 moduledata layouts.
 fn layout_hints(
@@ -1442,5 +1986,40 @@ fn layout_hints(
         go_minor: go_version.and_then(parse_go_minor_version),
         has_typelink_section: sections.typelink.is_some(),
         has_go_type_section: sections.go_type.is_some(),
+        code_outside_data: ctx.format() == BinaryFormat::Wasm,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolchain_commit_reads_both_devel_forms() {
+        let tip = "go1.28-devel_2dbf8b413a Fri Nov 20 21:43:22 2026 -0800";
+        assert_eq!(toolchain_commit(tip), Some("2dbf8b413a"));
+        let experiment = "go1.28-devel_2dbf8b413a Fri Nov 20 21:43:22 2026 -0800 X:cgobindings";
+        assert_eq!(toolchain_commit(experiment), Some("2dbf8b413a"));
+        assert_eq!(
+            toolchain_commit("devel go1.23-abc1234 Tue Jan 2 2024"),
+            Some("abc1234")
+        );
+        for release in ["go1.27.4", "go1.27rc1", "go1.28"] {
+            assert_eq!(toolchain_commit(release), None, "{release}");
+        }
+    }
+
+    #[test]
+    fn go_minor_parses_every_version_form() {
+        for (version, minor) in [
+            ("go1.27.4", 27),
+            ("go1.27rc1", 27),
+            ("go1.28-devel_2dbf8b413a Fri Nov 20 21:43:22 2026 -0800", 28),
+            ("devel go1.23-abc1234 Tue Jan 2 2024", 23),
+            ("go1.9", 9),
+        ] {
+            assert_eq!(parse_go_minor_version(version), Some(minor), "{version}");
+        }
+        assert_eq!(parse_go_minor_version("devel +abc1234"), None);
     }
 }

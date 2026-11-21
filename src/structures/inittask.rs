@@ -19,10 +19,7 @@
 //! the pclntab function table) yields a readable startup order - useful for
 //! understanding droppers' persistence / staging behaviour.
 
-use crate::{
-    formats::BinaryContext,
-    structures::{moduledata::Moduledata, util::read_uintptr},
-};
+use crate::{formats::BinaryContext, structures::moduledata::Moduledata, util::read_uintptr};
 
 /// Hard caps so adversarial `len`/`nfns` fields cannot blow up memory.
 const MAX_TASKS: usize = 100_000;

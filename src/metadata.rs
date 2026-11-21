@@ -30,11 +30,10 @@
 //! - **Build info**: accessed by `runtime/debug.ReadBuildInfo()`
 //! - **Types**: needed for `reflect`, interface dispatch, `fmt.Printf("%T", x)`
 
-use std::borrow::Cow;
-
 use crate::{
     detection::Confidence,
-    structures::pclntab::{FuncData, FuncEntryIter, ParsedPclntab},
+    names::{is_cgo_stub, package_boundary, package_of},
+    structures::pclntab::{FuncData, FuncEntryIter, FuncId, OwnCode, ParsedPclntab},
 };
 
 /// Whether `pkg` is a Go runtime package.
@@ -422,51 +421,14 @@ fn has_numeric_suffix_after(name: &str, marker: &str) -> bool {
     false
 }
 
-/// Package path portion of a fully-qualified function name, or `None` if the
-/// name has no package boundary. Mirrors [`FunctionInfo::package`] for callers
-/// that hold a bare `&str`.
-pub(crate) fn package_of(name: &str) -> Option<&str> {
-    let boundary = package_boundary(name)?;
-    name.get(..boundary)
-}
-
-/// Locate the package/short-name boundary in a Go function name.
-///
-/// Returns the byte index of the `.` that separates package path from the
-/// trailing identifier(s). Both [`FunctionInfo::package`] and
-/// [`FunctionInfo::short_name`] dispatch to this so they always agree.
-///
-/// The base rule is "first `.` after the last `/`". Path segments use `/`
-/// and identifiers do not, so this correctly distinguishes
-/// `github.com/spf13/cobra.(*Command).Run` (package `github.com/spf13/cobra`)
-/// from `runtime.gcStart` (package `runtime`).
-///
-/// On top of that we extend past `gopkg.in`-style `.vN` segments: a package
-/// path like `gopkg.in/yaml.v3` ends with a `.vN` version that the base rule
-/// would split incorrectly. If the segment immediately after the candidate
-/// boundary matches `v<digits>.`, the boundary moves to the next `.`.
-fn package_boundary(name: &str) -> Option<usize> {
-    let last_slash = name.rfind('/').and_then(|p| p.checked_add(1)).unwrap_or(0);
-    let segment = name.get(last_slash..)?;
-    let first_dot = segment.find('.')?;
-    let mut boundary = last_slash.checked_add(first_dot)?;
-
-    let after_start = boundary.checked_add(1)?;
-    if let Some(after) = name.get(after_start..)
-        && let Some(rest) = after.strip_prefix('v')
-    {
-        let digit_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-        if digit_end > 0 && rest.as_bytes().get(digit_end) == Some(&b'.') {
-            // boundary advances by '.' + 'v' + N digits = 2 + digit_end
-            boundary = boundary.checked_add(2)?.checked_add(digit_end)?;
-        }
-    }
-    Some(boundary)
-}
-
 /// The Go `-buildmode` value the binary was compiled with.
 ///
 /// Source: `src/cmd/go/internal/work/init.go` (`-buildmode` flag definitions).
+///
+/// The build info records the mode the linker was given. Before Go 1.28 an
+/// unset or `default` mode is recorded as `exe` even where the default is
+/// position-independent (darwin, ios, android, windows without `-race`); from
+/// Go 1.28 it is recorded as `pie` there.
 ///
 /// # Stability
 ///
@@ -480,8 +442,8 @@ fn package_boundary(name: &str) -> Option<usize> {
 ///   serialization keys.
 /// - **`Debug` strings** - *not* a stability surface. Use `Display` /
 ///   `as_str` for anything that lands in a database column.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuildMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMode<'a> {
     /// Default executable (`-buildmode=exe` or unset).
     Exe,
     /// Position-independent executable (`-buildmode=pie`).
@@ -496,13 +458,13 @@ pub enum BuildMode {
     Archive,
     /// Shared library of multiple Go packages (`-buildmode=shared`).
     Shared,
-    /// Any other / future build mode value as a verbatim string.
-    Other(String),
+    /// Any other / future build mode value, verbatim from the build info.
+    Other(&'a str),
 }
 
-impl BuildMode {
+impl<'a> BuildMode<'a> {
     /// Parse a raw `-buildmode` setting value into a [`BuildMode`].
-    pub fn parse(value: &str) -> Self {
+    pub fn parse(value: &'a str) -> Self {
         match value {
             "exe" | "" => Self::Exe,
             "pie" => Self::Pie,
@@ -511,7 +473,7 @@ impl BuildMode {
             "plugin" => Self::Plugin,
             "archive" => Self::Archive,
             "shared" => Self::Shared,
-            other => Self::Other(other.to_string()),
+            other => Self::Other(other),
         }
     }
 
@@ -521,25 +483,79 @@ impl BuildMode {
     /// Returns the same kebab-case identifiers the Go toolchain accepts
     /// (`"exe"`, `"pie"`, `"c-shared"`, `"c-archive"`, `"plugin"`,
     /// `"archive"`, `"shared"`). For [`BuildMode::Other`] the inner verbatim
-    /// string is returned as a borrowed `Cow`. See the `# Stability` section
-    /// on [`BuildMode`] for the durability contract.
-    pub fn as_str(&self) -> Cow<'static, str> {
+    /// string. See the `# Stability` section on [`BuildMode`] for the
+    /// durability contract.
+    pub fn as_str(&self) -> &'a str {
         match self {
-            Self::Exe => Cow::Borrowed("exe"),
-            Self::Pie => Cow::Borrowed("pie"),
-            Self::CShared => Cow::Borrowed("c-shared"),
-            Self::CArchive => Cow::Borrowed("c-archive"),
-            Self::Plugin => Cow::Borrowed("plugin"),
-            Self::Archive => Cow::Borrowed("archive"),
-            Self::Shared => Cow::Borrowed("shared"),
-            Self::Other(s) => Cow::Owned(s.clone()),
+            Self::Exe => "exe",
+            Self::Pie => "pie",
+            Self::CShared => "c-shared",
+            Self::CArchive => "c-archive",
+            Self::Plugin => "plugin",
+            Self::Archive => "archive",
+            Self::Shared => "shared",
+            Self::Other(s) => s,
         }
     }
 }
 
-impl std::fmt::Display for BuildMode {
+impl std::fmt::Display for BuildMode<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.as_str())
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a build enabled cgo: the `CGO_ENABLED` build setting.
+///
+/// Source: `src/cmd/go/internal/load/pkg.go` (`setBuildInfo`), which records
+/// the value the build ran with.
+///
+/// # Stability
+///
+/// The same contract as [`BuildMode`]: variants are append-only, and the
+/// `Display` strings (and [`Self::as_str`]) are the recorded setting values,
+/// fixed forever and round-tripping through [`Self::parse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgoMode<'a> {
+    /// cgo disabled (`CGO_ENABLED=0`).
+    Disabled,
+    /// cgo enabled with a C toolchain (`CGO_ENABLED=1`).
+    Enabled,
+    /// cgo bindings (`CGO_ENABLED=bindings`, Go 1.28; first behind
+    /// `GOEXPERIMENT=cgobindings`): packages that declare `//cgo:func` and
+    /// related pragmas call C without a C compiler, while the `cgo` build tag
+    /// is off.
+    Bindings,
+    /// Any other / future value, verbatim from the build info.
+    Other(&'a str),
+}
+
+impl<'a> CgoMode<'a> {
+    /// Parse a raw `CGO_ENABLED` setting value into a [`CgoMode`].
+    pub fn parse(value: &'a str) -> Self {
+        match value {
+            "0" => Self::Disabled,
+            "1" => Self::Enabled,
+            "bindings" => Self::Bindings,
+            other => Self::Other(other),
+        }
+    }
+
+    /// The recorded setting value, suitable for round-tripping through
+    /// [`Self::parse`]. See the `# Stability` section on [`CgoMode`].
+    pub fn as_str(&self) -> &'a str {
+        match self {
+            Self::Disabled => "0",
+            Self::Enabled => "1",
+            Self::Bindings => "bindings",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for CgoMode<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -556,7 +572,8 @@ impl std::fmt::Display for BuildMode {
 /// |------------------|---------------|--------------------------------|
 /// | `-buildmode`     | `exe`         | Build mode                     |
 /// | `-compiler`      | `gc`          | Compiler toolchain             |
-/// | `CGO_ENABLED`    | `1`           | CGo enablement                 |
+/// | `-mod`           | `vendor`      | Vendored build (Go 1.28+)      |
+/// | `CGO_ENABLED`    | `0`/`1`/`bindings` | CGo enablement ([`CgoMode`]) |
 /// | `GOOS`           | `linux`       | Target OS                      |
 /// | `GOARCH`         | `amd64`       | Target architecture            |
 /// | `GOAMD64`        | `v1`          | AMD64 microarch level          |
@@ -603,14 +620,34 @@ impl<'a> BuildInfo<'a> {
         self.setting("GOARCH")
     }
 
-    /// Whether CGo was enabled at build time.
-    pub fn cgo_enabled(&self) -> Option<bool> {
-        self.setting("CGO_ENABLED").map(|v| v == "1")
+    /// How the build enabled cgo (`CGO_ENABLED` build setting): off, on with
+    /// a C toolchain, or the cgo bindings of Go 1.28 that need none.
+    ///
+    /// `None` when the build info records no `CGO_ENABLED` (before Go 1.18).
+    pub fn cgo_mode(&self) -> Option<CgoMode<'a>> {
+        self.setting("CGO_ENABLED").map(CgoMode::parse)
+    }
+
+    /// Whether the build used the module's `vendor` directory
+    /// (`-mod=vendor`), which Go records from Go 1.28 on: the dependency
+    /// versions listed are then those vendored, which the go command cannot
+    /// check against their sums.
+    ///
+    /// `false` when the setting is absent, as it is for every other `-mod`
+    /// value and for every binary built before Go 1.28.
+    pub fn vendored(&self) -> bool {
+        self.setting("-mod") == Some("vendor")
     }
 
     /// VCS commit hash, if the binary was built from a VCS checkout.
     pub fn vcs_revision(&self) -> Option<&'a str> {
         self.setting("vcs.revision")
+    }
+
+    /// Commit time of the VCS revision (`vcs.time`), RFC 3339 in UTC as the
+    /// go command writes it (e.g. `2024-05-01T12:34:56Z`).
+    pub fn vcs_time(&self) -> Option<&'a str> {
+        self.setting("vcs.time")
     }
 
     /// Whether the VCS working tree was dirty at build time.
@@ -664,7 +701,7 @@ impl<'a> BuildInfo<'a> {
     /// Returns `None` only if the binary lacks build settings entirely
     /// (unparseable build info). A binary built without explicit `-buildmode`
     /// returns `Some(BuildMode::Exe)`.
-    pub fn build_mode(&self) -> Option<BuildMode> {
+    pub fn build_mode(&self) -> Option<BuildMode<'a>> {
         if self.build_settings.is_empty() {
             return None;
         }
@@ -690,37 +727,42 @@ impl<'a> BuildInfo<'a> {
 pub struct FunctionInfo<'a> {
     /// Full package-qualified function name (borrowed from pclntab funcnametab).
     pub name: &'a str,
-    /// PC offset from `runtime.text` (the start of executable code).
-    pub entry_offset: u32,
-    /// Total argument size in bytes (input + output parameters).
-    pub args_size: i32,
-    /// Source line number where the `func` keyword appears.
-    pub start_line: i32,
-    /// Special function ID (0 = normal). See [`crate::structures::pclntab::FuncData`]
-    /// for the FuncID value table.
-    pub func_id: u8,
-    /// Function flags (top-frame, SP-write, asm).
-    pub flags: u8,
-    /// Offset from function entry to the `deferreturn` call (0 if no defer).
-    pub deferreturn: u32,
-    /// Offset into `pctab` for the stack-pointer delta table.
-    pub pcsp: u32,
-    /// Offset into `pctab` for the PC-to-file mapping table.
-    pub pcfile: u32,
-    /// Offset into `pctab` for the PC-to-line mapping table.
-    pub pcln: u32,
-    /// Number of PCDATA entries (metadata tables per PC range).
-    pub npcdata: u32,
-    /// Compilation unit offset in `cutab`.
-    pub cu_offset: u32,
-    /// Number of FUNCDATA entries (per-function data blobs like stack maps).
-    pub nfuncdata: u8,
-    /// Source file path for this function's entry point (resolved from pcfile + cutab).
+    /// The function's `_func` record: its entry offset, argument size, start
+    /// line, raw ID and flags, and the offsets of its per-PC tables.
+    pub func: FuncData,
+    /// What the record's funcID marks the function as, classified against
+    /// the binary's wrapper ID ([`FuncId::classify`]).
+    pub func_id: FuncId,
+    /// Source file of the function's own code, leaving out code inlined into
+    /// it ([`ParsedPclntab::own_code`]).
     pub source_file: Option<&'a str>,
-    /// Last source line in the function (decoded from the pcln table).
+    /// Last source line of the function's own code, leaving out code inlined
+    /// into it ([`ParsedPclntab::own_code`]); `0` when the line table is empty.
     pub end_line: i32,
     /// Maximum stack frame size in bytes (decoded from the pcsp table).
     pub frame_size: i32,
+}
+
+impl<'a> FunctionInfo<'a> {
+    /// The function described by the `_func` record `func` of `pclntab`: its
+    /// name, the source file and last line of its own code, and the largest
+    /// frame its tables record.
+    pub fn from_func(pclntab: &ParsedPclntab<'a>, func: FuncData) -> Self {
+        let name = pclntab
+            .func_name(func.name_off as u32)
+            .unwrap_or("<unknown>");
+        let own = pclntab.own_code(&func);
+        Self {
+            name,
+            func_id: pclntab.func_id(&func, name),
+            source_file: own
+                .file_index
+                .and_then(|index| pclntab.resolve_file_index(func.cu_offset, index)),
+            end_line: own.lines.map_or(0, |(_, end)| end),
+            frame_size: pclntab.max_frame_size(&func).unwrap_or(0),
+            func,
+        }
+    }
 }
 
 impl FunctionInfo<'_> {
@@ -734,15 +776,17 @@ impl FunctionInfo<'_> {
     /// which are part of the package path.
     ///
     /// ```
-    /// # use gobin::metadata::FunctionInfo;
-    /// # fn f(name: &str) -> FunctionInfo<'_> { FunctionInfo { name, entry_offset: 0, args_size: 0, start_line: 0, func_id: 0, flags: 0, deferreturn: 0, pcsp: 0, pcfile: 0, pcln: 0, npcdata: 0, cu_offset: 0, nfuncdata: 0, source_file: None, end_line: 0, frame_size: 0 } }
+    /// # use gobin::{metadata::FunctionInfo, structures::pclntab::{FuncData, FuncId}};
+    /// # fn f(name: &str) -> FunctionInfo<'_> {
+    /// #     let func = FuncData { func_off: 0, entry_off: 0, name_off: 0, args: 0, deferreturn: 0, pcsp: 0, pcfile: 0, pcln: 0, npcdata: 0, cu_offset: 0, start_line: 0, func_id: 0, flag: 0, nfuncdata: 0 };
+    /// #     FunctionInfo { name, func, func_id: FuncId::Normal, source_file: None, end_line: 0, frame_size: 0 }
+    /// # }
     /// assert_eq!(f("net/http.(*Client).Do").package(), Some("net/http"));
     /// assert_eq!(f("github.com/spf13/cobra.(*Command).Run").package(), Some("github.com/spf13/cobra"));
     /// assert_eq!(f("gopkg.in/yaml.v3.Marshal").package(), Some("gopkg.in/yaml.v3"));
     /// ```
     pub fn package(&self) -> Option<&str> {
-        let boundary = package_boundary(self.name)?;
-        Some(&self.name[..boundary])
+        package_of(self.name)
     }
 
     /// Whether this is a Go runtime function (`"runtime."` prefix).
@@ -819,12 +863,20 @@ impl FunctionInfo<'_> {
 
     /// Whether this function uses `defer` (nonzero `deferreturn` offset).
     pub fn uses_defer(&self) -> bool {
-        self.deferreturn != 0
+        self.func.deferreturn != 0
     }
 
-    /// Strongly-typed view of the [`Self::flags`] byte.
+    /// Strongly-typed view of the `_func.flag` byte.
     pub fn func_flags(&self) -> FuncFlags {
-        FuncFlags(self.flags)
+        FuncFlags(self.func.flag)
+    }
+
+    /// Whether the compiler marked this function a wrapper
+    /// ([`FuncId::Wrapper`]): compiler-generated code (method value and
+    /// interface wrappers, hash and equality algorithms) and the few runtime
+    /// functions tracebacks hide alike.
+    pub fn is_wrapper(&self) -> bool {
+        self.func_id == FuncId::Wrapper
     }
 
     /// Whether this function is marked top-of-stack (e.g. `runtime.goexit`).
@@ -851,13 +903,15 @@ impl FunctionInfo<'_> {
         self.func_flags().is_asm()
     }
 
-    /// Whether this function runs on the system stack (`FuncIDsystemstack` /
-    /// `FuncIDsystemstack_switch`).
-    ///
-    /// Inferred from [`Self::func_id`], not from `flag` - the runtime tracks
-    /// systemstack by ID rather than a flag bit.
+    /// Whether this is `runtime.systemstack` or `runtime.systemstack_switch`,
+    /// the functions that switch to the system stack ([`FuncId::Systemstack`],
+    /// [`FuncId::SystemstackSwitch`]). The runtime marks them by ID, not by a
+    /// flag bit.
     pub fn is_systemstack(&self) -> bool {
-        matches!(self.func_id, 98 | 99)
+        matches!(
+            self.func_id,
+            FuncId::Systemstack | FuncId::SystemstackSwitch
+        )
     }
 
     /// Whether this is a compiler-generated closure or `gowrap` stub.
@@ -884,35 +938,300 @@ impl FunctionInfo<'_> {
     pub fn is_stdlib(&self) -> bool {
         self.package().is_some_and(is_stdlib_path)
     }
+}
 
-    /// Human-readable FuncID label, if this is a special runtime function.
-    pub fn func_id_name(&self) -> Option<&'static str> {
-        match self.func_id {
-            0 => None,
-            80 => Some("abort"),
-            81 => Some("asmcgocall"),
-            82 => Some("asyncPreempt"),
-            83 => Some("cgocallback"),
-            84 => Some("debugCallV2"),
-            85 => Some("gcBgMarkWorker"),
-            86 => Some("goexit"),
-            87 => Some("gogo"),
-            88 => Some("gopanic"),
-            89 => Some("handleAsyncEvent"),
-            90 => Some("mcall"),
-            91 => Some("morestack"),
-            92 => Some("mstart"),
-            93 => Some("panicwrap"),
-            94 => Some("rt0_go"),
-            95 => Some("runfinq"),
-            96 => Some("runtime_main"),
-            97 => Some("sigpanic"),
-            98 => Some("systemstack"),
-            99 => Some("systemstack_switch"),
-            100 => Some("wrapper"),
-            _ => Some("unknown_special"),
+/// Where a binary was built, read off the source paths its pclntab records
+/// ([`crate::GoBinary::build_paths`]): the attribution a build without
+/// `-trimpath` leaves. A field is `None` when the paths are trimmed (Go
+/// records them relative, `runtime/proc.go`) or name no such place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuildPaths<'a> {
+    /// GOROOT: the root of the runtime package's files,
+    /// `<goroot>/src/runtime/` (`<goroot>/src/pkg/runtime/` in Go 1.2-1.3).
+    pub goroot: Option<&'a str>,
+    /// The module cache (`GOMODCACHE`): the root of a module's files,
+    /// `<cache>/<module path>@<version>/`.
+    pub module_cache: Option<&'a str>,
+    /// GOPATH: the root of a package's files in GOPATH mode,
+    /// `<gopath>/src/<import path>/`, or the module cache's parent when it is
+    /// the default `<gopath>/pkg/mod`.
+    pub gopath: Option<&'a str>,
+    /// The directory of the main package's files.
+    pub main_dir: Option<&'a str>,
+    /// The home directory those paths are under: `/home/<user>`,
+    /// `/Users/<user>`, `/root` or `<drive>:/Users/<user>`.
+    pub home: Option<&'a str>,
+}
+
+impl<'a> BuildPaths<'a> {
+    /// Read the paths off `(package path, source file)` pairs, one or more
+    /// per package.
+    pub fn from_files(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let files: Vec<(&str, &str)> = files
+            .into_iter()
+            .filter(|(_, file)| is_absolute(file))
+            .collect();
+        let mut paths = Self::default();
+        for &(package, file) in &files {
+            let dir = parent(file);
+            match package {
+                "main" => paths.main_dir = paths.main_dir.or(Some(dir)),
+                "runtime" => {
+                    paths.goroot = paths.goroot.or_else(|| {
+                        strip_path_suffix(dir, "/src/runtime")
+                            .or_else(|| strip_path_suffix(dir, "/src/pkg/runtime"))
+                    });
+                }
+                _ => {}
+            }
+        }
+        for &(package, file) in &files {
+            if matches!(package, "main" | "runtime") {
+                continue;
+            }
+            let dir = parent(file);
+            if let Some(cache) = module_root(dir, package) {
+                paths.module_cache = paths.module_cache.or(Some(cache));
+                paths.gopath = paths
+                    .gopath
+                    .or_else(|| strip_path_suffix(cache, "/pkg/mod"));
+                continue;
+            }
+            // A package under another root than GOROOT is a GOPATH one; one
+            // whose path names no domain may be a GOROOT package itself, so
+            // it counts only once GOROOT is known.
+            let dotted = package
+                .split('/')
+                .next()
+                .is_some_and(|first| first.contains('.'));
+            let Some(root) = strip_path_suffix(dir, &format!("/src/{package}")) else {
+                continue;
+            };
+            if dotted || paths.goroot.is_some_and(|goroot| goroot != root) {
+                paths.gopath = paths.gopath.or(Some(root));
+            }
+        }
+        paths.home = [
+            paths.main_dir,
+            paths.module_cache,
+            paths.gopath,
+            paths.goroot,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(files.iter().map(|&(_, file)| file))
+        .find_map(home_dir);
+        paths
+    }
+}
+
+/// Whether `path` is absolute: rooted at `/`, or at a Windows drive.
+fn is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.first() == Some(&b'/')
+        || (bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && matches!(bytes.get(2), Some(b'/' | b'\\')))
+}
+
+/// `path` up to its last separator (`/`, or `\` on Windows).
+fn parent(path: &str) -> &str {
+    path.rfind(['/', '\\'])
+        .and_then(|end| path.get(..end))
+        .unwrap_or("")
+}
+
+/// `path` less `suffix`, matching `/` in `suffix` against either separator.
+fn strip_path_suffix<'p>(path: &'p str, suffix: &str) -> Option<&'p str> {
+    let start = path.len().checked_sub(suffix.len())?;
+    let tail = path.get(start..)?;
+    let same = tail
+        .bytes()
+        .zip(suffix.bytes())
+        .all(|(a, b)| a == b || (a == b'\\' && b == b'/'));
+    same.then(|| path.get(..start)).flatten()
+}
+
+/// The module cache root of a file of package `package` in directory `dir`:
+/// the prefix before `/<module path>@`, where the module path is a leading
+/// part of the package path, written with the cache's escaping (an upper-case
+/// letter becomes `!` and the letter in lower case).
+fn module_root<'d>(dir: &'d str, package: &str) -> Option<&'d str> {
+    let at = dir.find('@')?;
+    let before = dir.get(..at)?;
+    let mut cuts: Vec<usize> = package.match_indices('/').map(|(i, _)| i).collect();
+    cuts.push(package.len());
+    cuts.into_iter().rev().find_map(|cut| {
+        let module = escape_module_path(package.get(..cut)?);
+        strip_path_suffix(before, &format!("/{module}"))
+    })
+}
+
+/// A module path as the module cache spells it (`golang.org/x/mod/module`,
+/// `EscapePath`).
+fn escape_module_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('!');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
         }
     }
+    out
+}
+
+/// The home directory `path` lies under, if it names one.
+fn home_dir(path: &str) -> Option<&str> {
+    if path == "/root" || path.starts_with("/root/") {
+        return path.get(..5);
+    }
+    let drive = is_absolute(path) && !path.starts_with('/');
+    let users = if path.starts_with("/home/") {
+        6
+    } else if path.starts_with("/Users/") {
+        7
+    } else if drive && matches!(path.get(3..9), Some("Users/" | "Users\\")) {
+        9
+    } else {
+        return None;
+    };
+    let rest = path.get(users..)?;
+    let user = rest.find(['/', '\\']).unwrap_or(rest.len());
+    if user == 0 {
+        return None;
+    }
+    path.get(..users.checked_add(user)?)
+}
+
+/// What a call to a runtime hook does ([`crate::GoBinary::runtime_hooks`]).
+///
+/// The compiler lowers these Go operations to calls of fixed runtime (and
+/// `syscall`) functions, so a call to one of them in the code marks the
+/// operation at that call site. Finding the call sites takes a disassembler;
+/// the hooks are their targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookKind {
+    /// A call into C: `runtime.cgocall`, and each stub cgo generates for a C
+    /// function (`pkg._Cfunc_<name>`), named for the C function it calls.
+    CgoCall,
+    /// The entry C code calls Go through (`runtime.cgocallback`), also used
+    /// by Windows system callbacks.
+    CgoCallback,
+    /// A `go` statement (`runtime.newproc`).
+    Spawn,
+    /// `make(chan T)` (`runtime.makechan`, `makechan64`).
+    ChanMake,
+    /// A channel send (`runtime.chansend1`), or a non-blocking one in a
+    /// `select` with one case and a default (`runtime.selectnbsend`).
+    ChanSend,
+    /// A channel receive (`runtime.chanrecv1`, `chanrecv2` for `v, ok`), or a
+    /// non-blocking one (`runtime.selectnbrecv`, and `selectnbrecv2` before
+    /// Go 1.17).
+    ChanRecv,
+    /// `close(ch)` (`runtime.closechan`).
+    ChanClose,
+    /// A `select` statement (`runtime.selectgo`; before Go 1.11 built up by
+    /// `runtime.newselect`, `selectsend`, `selectrecv`, `selectrecv2` and
+    /// `selectdefault` first), or an empty `select {}` (`runtime.block`).
+    Select,
+    /// A `defer` statement the compiler did not open-code
+    /// (`runtime.deferproc`, `deferprocStack` from Go 1.13, `deferprocat` from
+    /// Go 1.23). Open-coded defers (Go 1.14+) call nothing; see
+    /// [`crate::GoBinary::open_defers`].
+    Defer,
+    /// `panic(v)` (`runtime.gopanic`; `runtime.panic` before Go 1.4).
+    Panic,
+    /// `recover()` (`runtime.gorecover`; `runtime.recover` before Go 1.4).
+    Recover,
+    /// The registration of a package's coverage metadata
+    /// (`runtime.addCovMeta`, Go 1.20+ `-cover` builds), the first call of
+    /// each instrumented package's init function. Its arguments are the
+    /// metadata blob's address, length and hash, the package path, its id,
+    /// and the counter mode and granularity: see
+    /// [`crate::structures::coverage`].
+    CoverageRegistration,
+    /// A raw system call through package `syscall` or the runtime's
+    /// (`syscall.Syscall`, `Syscall6`, `SyscallN`, `RawSyscall`, the darwin
+    /// `syscall.syscall` family, `internal/runtime/syscall.Syscall6`, ...).
+    Syscall,
+}
+
+/// The runtime and `syscall` functions each [`HookKind`] names, across Go
+/// versions: a function a release lacks is simply not found.
+///
+/// Source: `src/cmd/compile/internal/walk` and
+/// `src/cmd/compile/internal/ssagen/ssa.go` (the calls the compiler emits),
+/// `src/syscall/syscall_*.go`.
+const RUNTIME_HOOKS: &[(&str, HookKind)] = &[
+    ("runtime.cgocall", HookKind::CgoCall),
+    ("runtime.cgocallback", HookKind::CgoCallback),
+    ("runtime.newproc", HookKind::Spawn),
+    ("runtime.makechan", HookKind::ChanMake),
+    ("runtime.makechan64", HookKind::ChanMake),
+    ("runtime.chansend1", HookKind::ChanSend),
+    ("runtime.selectnbsend", HookKind::ChanSend),
+    ("runtime.chanrecv1", HookKind::ChanRecv),
+    ("runtime.chanrecv2", HookKind::ChanRecv),
+    ("runtime.selectnbrecv", HookKind::ChanRecv),
+    ("runtime.selectnbrecv2", HookKind::ChanRecv),
+    ("runtime.closechan", HookKind::ChanClose),
+    ("runtime.selectgo", HookKind::Select),
+    ("runtime.newselect", HookKind::Select),
+    ("runtime.selectsend", HookKind::Select),
+    ("runtime.selectrecv", HookKind::Select),
+    ("runtime.selectrecv2", HookKind::Select),
+    ("runtime.selectdefault", HookKind::Select),
+    ("runtime.block", HookKind::Select),
+    ("runtime.deferproc", HookKind::Defer),
+    ("runtime.deferprocStack", HookKind::Defer),
+    ("runtime.deferprocat", HookKind::Defer),
+    ("runtime.gopanic", HookKind::Panic),
+    ("runtime.panic", HookKind::Panic),
+    ("runtime.gorecover", HookKind::Recover),
+    ("runtime.addCovMeta", HookKind::CoverageRegistration),
+    ("runtime.recover", HookKind::Recover),
+    ("syscall.Syscall", HookKind::Syscall),
+    ("syscall.Syscall6", HookKind::Syscall),
+    ("syscall.Syscall9", HookKind::Syscall),
+    ("syscall.Syscall12", HookKind::Syscall),
+    ("syscall.Syscall15", HookKind::Syscall),
+    ("syscall.Syscall18", HookKind::Syscall),
+    ("syscall.SyscallN", HookKind::Syscall),
+    ("syscall.RawSyscall", HookKind::Syscall),
+    ("syscall.RawSyscall6", HookKind::Syscall),
+    ("syscall.syscall", HookKind::Syscall),
+    ("syscall.syscall6", HookKind::Syscall),
+    ("syscall.syscall6X", HookKind::Syscall),
+    ("syscall.syscall9", HookKind::Syscall),
+    ("syscall.rawSyscall", HookKind::Syscall),
+    ("syscall.rawSyscall6", HookKind::Syscall),
+    ("internal/runtime/syscall.Syscall6", HookKind::Syscall),
+    ("runtime/internal/syscall.Syscall6", HookKind::Syscall),
+];
+
+impl HookKind {
+    /// The hook the function named `name` is, if any.
+    pub fn of(name: &str) -> Option<Self> {
+        if is_cgo_stub(name) {
+            return Some(Self::CgoCall);
+        }
+        RUNTIME_HOOKS
+            .iter()
+            .find(|(hook, _)| *hook == name)
+            .map(|&(_, kind)| kind)
+    }
+}
+
+/// One function a [`HookKind`] names, found in the binary.
+#[derive(Debug, Clone)]
+pub struct RuntimeHook<'a> {
+    /// What a call to it does.
+    pub kind: HookKind,
+    /// The function: its entry is where such calls land
+    /// ([`crate::GoBinary::entry_va`]).
+    pub function: FunctionInfo<'a>,
 }
 
 /// Strongly-typed view of the `_func.flag` byte.
@@ -968,12 +1287,12 @@ impl FuncFlags {
 /// to keep them across iterations, copy via `.to_vec()`.
 #[derive(Debug)]
 pub struct FunctionTables<'a> {
-    /// PC -> absolute line number.
+    /// `(pc_end, line)` steps ([`ParsedPclntab::decode_pcln`]).
     pub pcln: &'a [(u32, i32)],
-    /// PC -> stack pointer delta.
+    /// `(pc_end, stack pointer delta)` steps.
     pub pcsp: &'a [(u32, i32)],
-    /// PC -> file index. Resolve via
-    /// [`ParsedPclntab::resolve_file_via_cu`] using `FuncData::cu_offset`.
+    /// `(pc_end, file index)` steps. Resolve an index via
+    /// [`ParsedPclntab::resolve_file_index`] using `FuncData::cu_offset`.
     pub pcfile: &'a [(u32, u32)],
 }
 
@@ -1019,27 +1338,21 @@ where
         pcfile_buf.clear();
         pcfile_buf.extend(pclntab.decode_pcfile(&func_data));
 
-        let source_file = pcfile_buf
-            .first()
-            .and_then(|(_, idx)| pclntab.resolve_file_via_cu(func_data.cu_offset, *idx));
-
-        let end_line = pcln_buf.iter().map(|e| e.1).max().unwrap_or(0);
+        let own = OwnCode::walk(
+            pcln_buf.iter().copied(),
+            pcfile_buf.iter().copied(),
+            pclntab.inline_index_table(&func_data),
+        );
+        let source_file = own
+            .file_index
+            .and_then(|index| pclntab.resolve_file_index(func_data.cu_offset, index));
+        let end_line = own.lines.map_or(0, |(_, end)| end);
         let frame_size = pcsp_buf.iter().map(|e| e.1).max().unwrap_or(0);
 
         let info = FunctionInfo {
             name,
-            entry_offset: func_data.entry_off,
-            args_size: func_data.args,
-            start_line: func_data.start_line,
-            func_id: func_data.func_id,
-            flags: func_data.flag,
-            deferreturn: func_data.deferreturn,
-            pcsp: func_data.pcsp,
-            pcfile: func_data.pcfile,
-            pcln: func_data.pcln,
-            npcdata: func_data.npcdata,
-            cu_offset: func_data.cu_offset,
-            nfuncdata: func_data.nfuncdata,
+            func_id: pclntab.func_id(&func_data, name),
+            func: func_data,
             source_file,
             end_line,
             frame_size,
@@ -1107,35 +1420,7 @@ impl<'a> Iterator for FunctionIter<'a> {
                 Some(fd) => fd,
                 None => continue,
             };
-            let name = inner
-                .pclntab
-                .func_name(func_data.name_off as u32)
-                .unwrap_or("<unknown>");
-            let source_file = inner.pclntab.resolve_source_file(&func_data);
-            let end_line = inner
-                .pclntab
-                .line_range(&func_data)
-                .map(|(_, end)| end)
-                .unwrap_or(0);
-            let frame_size = inner.pclntab.max_frame_size(&func_data).unwrap_or(0);
-            return Some(FunctionInfo {
-                name,
-                entry_offset: func_data.entry_off,
-                args_size: func_data.args,
-                start_line: func_data.start_line,
-                func_id: func_data.func_id,
-                flags: func_data.flag,
-                deferreturn: func_data.deferreturn,
-                pcsp: func_data.pcsp,
-                pcfile: func_data.pcfile,
-                pcln: func_data.pcln,
-                npcdata: func_data.npcdata,
-                cu_offset: func_data.cu_offset,
-                nfuncdata: func_data.nfuncdata,
-                source_file,
-                end_line,
-                frame_size,
-            });
+            return Some(FunctionInfo::from_func(&inner.pclntab, func_data));
         }
     }
 }
@@ -1147,18 +1432,23 @@ mod tests {
     fn make(name: &'static str) -> FunctionInfo<'static> {
         FunctionInfo {
             name,
-            entry_offset: 0,
-            args_size: 0,
-            start_line: 0,
-            func_id: 0,
-            flags: 0,
-            deferreturn: 0,
-            pcsp: 0,
-            pcfile: 0,
-            pcln: 0,
-            npcdata: 0,
-            cu_offset: 0,
-            nfuncdata: 0,
+            func_id: FuncId::Normal,
+            func: FuncData {
+                func_off: 0,
+                entry_off: 0,
+                name_off: 0,
+                args: 0,
+                deferreturn: 0,
+                pcsp: 0,
+                pcfile: 0,
+                pcln: 0,
+                npcdata: 0,
+                cu_offset: 0,
+                start_line: 0,
+                func_id: 0,
+                flag: 0,
+                nfuncdata: 0,
+            },
             source_file: None,
             end_line: 0,
             frame_size: 0,
@@ -1294,7 +1584,7 @@ mod tests {
         assert_eq!(BuildMode::parse("plugin"), BuildMode::Plugin);
         assert_eq!(
             BuildMode::parse("future-mode"),
-            BuildMode::Other("future-mode".into())
+            BuildMode::Other("future-mode")
         );
     }
 
@@ -1373,7 +1663,7 @@ mod tests {
     #[test]
     fn is_closure_excludes_asm_funcs() {
         let mut f = make("runtime.x.func1");
-        f.flags = FuncFlags::ASM;
+        f.func.flag = FuncFlags::ASM;
         assert!(!f.is_closure(), "asm-flagged functions are never closures");
     }
 
@@ -1417,5 +1707,75 @@ mod tests {
         assert_eq!(make("sort.Slice[int]").generic_args(), Some("[int]"));
         assert_eq!(make("pkg.(*Map[K, V]).Len").generic_args(), Some("[K, V]"),);
         assert_eq!(make("fmt.Println").generic_args(), None);
+    }
+
+    #[test]
+    fn build_paths_follow_package_roots() {
+        let paths = BuildPaths::from_files([
+            ("runtime", "/usr/local/go/src/runtime/proc.go"),
+            ("fmt", "/usr/local/go/src/fmt/print.go"),
+            ("main", "/home/dev/src/app/main.go"),
+            (
+                "github.com/BurntSushi/toml",
+                "/home/dev/go/pkg/mod/github.com/!burnt!sushi/toml@v1.3.2/decode.go",
+            ),
+            (
+                "example.com/m/sub",
+                "/home/dev/go/pkg/mod/example.com/m@v1.0.0/sub/x.go",
+            ),
+            ("internal/abi", "internal/abi/type.go"),
+        ]);
+        assert_eq!(paths.goroot, Some("/usr/local/go"));
+        assert_eq!(paths.module_cache, Some("/home/dev/go/pkg/mod"));
+        assert_eq!(paths.gopath, Some("/home/dev/go"));
+        assert_eq!(paths.main_dir, Some("/home/dev/src/app"));
+        assert_eq!(paths.home, Some("/home/dev"));
+    }
+
+    #[test]
+    fn build_paths_unescape_module_paths() {
+        // The cache writes an upper-case letter as `!` and the lower case.
+        let paths = BuildPaths::from_files([(
+            "github.com/BurntSushi/toml",
+            "/home/dev/go/pkg/mod/github.com/!burnt!sushi/toml@v1.3.2/decode.go",
+        )]);
+        assert_eq!(paths.module_cache, Some("/home/dev/go/pkg/mod"));
+    }
+
+    #[test]
+    fn build_paths_read_gopath_mode_and_old_layouts() {
+        let paths = BuildPaths::from_files([
+            ("runtime", "/opt/go/src/pkg/runtime/proc.c"),
+            ("mytool/util", "/Users/ana/work/src/mytool/util/u.go"),
+            ("fmt", "/opt/go/src/pkg/fmt/print.go"),
+        ]);
+        assert_eq!(paths.goroot, Some("/opt/go"));
+        assert_eq!(paths.gopath, Some("/Users/ana/work"));
+        assert_eq!(paths.home, Some("/Users/ana"));
+        assert_eq!(paths.module_cache, None);
+    }
+
+    #[test]
+    fn build_paths_read_windows_paths() {
+        let paths = BuildPaths::from_files([
+            ("runtime", "C:/Program Files/Go/src/runtime/proc.go"),
+            ("main", "C:\\Users\\bob\\proj\\main.go"),
+        ]);
+        assert_eq!(paths.goroot, Some("C:/Program Files/Go"));
+        assert_eq!(paths.main_dir, Some("C:\\Users\\bob\\proj"));
+        assert_eq!(paths.home, Some("C:\\Users\\bob"));
+    }
+
+    #[test]
+    fn build_paths_ignore_trimmed_paths() {
+        let paths = BuildPaths::from_files([
+            ("runtime", "runtime/proc.go"),
+            ("main", "./main.go"),
+            ("example.com/m", "example.com/m@v1.0.0/m.go"),
+        ]);
+        assert_eq!(paths, BuildPaths::default());
+        assert_eq!(home_dir("/root"), Some("/root"));
+        assert_eq!(home_dir("/rootfs/x"), None);
+        assert_eq!(home_dir("/home/"), None);
     }
 }

@@ -33,10 +33,12 @@ pub mod bounds;
 pub mod buildid;
 pub mod buildinfo;
 pub mod chantype;
+pub mod coverage;
 pub mod descriptor;
 pub mod elemtype;
 pub mod embed;
 pub mod fixups;
+pub mod funcdata;
 pub mod functype;
 pub mod gcprog;
 pub mod goslice;
@@ -56,7 +58,6 @@ pub mod strings;
 pub mod structtype;
 pub mod types;
 pub mod uncommon;
-pub(crate) mod util;
 pub mod wasm;
 
 /// Target architecture, inferred from the pclntab header's `minLC` and `ptrSize` fields.

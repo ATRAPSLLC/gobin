@@ -32,10 +32,13 @@
 //! - Section name mapping: `go:buildinfo` symbol -> `.go.buildinfo` section
 //!   (`src/cmd/link/internal/ld/data.go:1831-1832`)
 
+use std::ops::Range;
+
 use goblin::{
+    container::Ctx,
     elf::{
         Elf,
-        program_header::{PT_LOAD, PT_NOTE},
+        program_header::{PT_LOAD, PT_NOTE, ProgramHeader},
         section_header::SHT_NOBITS,
     },
     mach::{MachO, load_command::CommandVariant},
@@ -43,11 +46,12 @@ use goblin::{
 };
 
 use crate::{
-    detection::find_bytes,
     structures::{
+        Arch,
         fixups::rebase,
-        wasm::{build_linear_memory_image, walk as walk_wasm_sections},
+        wasm::{LinearMemory, walk as walk_wasm_sections},
     },
+    util::find_bytes,
 };
 
 /// Wasm section id of the Code section, which holds the module's function
@@ -94,7 +98,11 @@ pub enum BinaryFormat {
     /// Data-section linear-memory payload alongside the rest of the
     /// runtime's static data. `text_va` and `etext_va` here are runtime
     /// "PC" boundaries - not byte offsets into the Code section - since
-    /// wasm encodes a Go PC as `(function_index << 16) | bytecode_offset`.
+    /// a Go PC numbers a function in its high bits and a resume point inside
+    /// it in its low 16: `text + (function << 16) + resume_point`, with
+    /// `text` at `0` before Go 1.28 and at `1 << 63` from Go 1.28 on (so a PC
+    /// never reads as a data address). See [`crate::GoBinary::text_addr`]
+    /// for how a function-table entry becomes that PC in each Go version.
     Wasm,
     /// Unrecognized format. Magic-byte scanning can still find Go structures.
     Unknown,
@@ -223,12 +231,18 @@ pub struct BinaryContext<'a> {
     /// from the LM image (`ParsedPclntab`, `GoType`, etc.) borrow with the
     /// same `&self` lifetime.
     wasm_lm: Option<Box<[u8]>>,
+    /// The lowest address a wasm data segment initializes; `None` for other
+    /// formats. See [`Self::wasm_initialized_start`].
+    wasm_initialized_start: Option<u64>,
     /// Owned, rebased copy of the file bytes for externally-linked Mach-O
     /// objects that use chained fixups (`LC_DYLD_CHAINED_FIXUPS`). Identical
     /// layout to the input, but every chained pointer slot holds its resolved
     /// virtual address so pointer reads work as on an ordinary binary. `None`
     /// for binaries without chained fixups. See [`structures::macho_fixups`].
     rebased: Option<Box<[u8]>>,
+    /// Whether the container's symbol table defines a symbol: see
+    /// [`Self::has_symbols`].
+    has_symbols: bool,
 }
 
 impl<'a> BinaryContext<'a> {
@@ -258,6 +272,7 @@ impl<'a> BinaryContext<'a> {
         let mut segments = Vec::new();
         let mut elf_note_segments = Vec::new();
         let mut image_base: u64 = 0;
+        let mut has_symbols = false;
         // Mach-O segment `(vmaddr, fileoff)` in load-command order, and the
         // `LC_DYLD_CHAINED_FIXUPS` data offset - both needed to rebase chained
         // fixups in externally-linked objects (plugins / CGO / c-shared).
@@ -271,7 +286,8 @@ impl<'a> BinaryContext<'a> {
         // output format; dispatching ourselves lets us drop those features.
         match format {
             BinaryFormat::Elf => {
-                if let Ok(elf) = Elf::parse(data) {
+                if let Some(elf) = Elf::parse(data).ok().or_else(|| elf_without_sections(data)) {
+                    has_symbols = crate::symbols::elf_defines_symbols(&elf);
                     // Sections → GoSections
                     for sh in &elf.section_headers {
                         let name = match elf.shdr_strtab.get_at(sh.sh_name) {
@@ -310,6 +326,7 @@ impl<'a> BinaryContext<'a> {
                 // only Mach variant the original `Mach::Binary` arm processed.
                 if let Ok(macho) = MachO::parse(data, 0) {
                     // Locate the chained-fixups load command, if present.
+                    has_symbols = crate::symbols::macho_defines_symbols(&macho);
                     for lc in &macho.load_commands {
                         if let CommandVariant::DyldChainedFixups(c) = &lc.command {
                             chained_fixups_off = Some(c.dataoff as usize);
@@ -352,6 +369,7 @@ impl<'a> BinaryContext<'a> {
                     .with_parse_tls_data(false);
                 if let Ok(pe) = PE::parse_with_opts(data, &opts) {
                     image_base = pe.image_base;
+                    has_symbols = crate::symbols::pe_defines_symbols(&pe, data);
                     for section in &pe.sections {
                         let va = image_base.saturating_add(section.virtual_address as u64);
                         let file_off = section.pointer_to_raw_data as u64;
@@ -390,6 +408,7 @@ impl<'a> BinaryContext<'a> {
         // linear-memory image so downstream parsers can address pclntab /
         // moduledata bytes by VA.
         let mut wasm_lm: Option<Box<[u8]>> = None;
+        let mut wasm_initialized_start: Option<u64> = None;
         if format == BinaryFormat::Wasm {
             for sec in walk_wasm_sections(data) {
                 if sec.id == 0 && sec.name == Some("go:buildid") {
@@ -427,15 +446,16 @@ impl<'a> BinaryContext<'a> {
             // Reconstruct the linear-memory image. Cap at 256 MB so an
             // adversarial wasm with absurd offsets can't blow our memory.
             const MAX_LM_BYTES: usize = 256 * 1024 * 1024;
-            if let Some(image) = build_linear_memory_image(data, MAX_LM_BYTES) {
+            if let Some(lm) = LinearMemory::assemble(data, MAX_LM_BYTES) {
                 // Register the linear-memory image as a single VA mapping.
                 // This makes `va_to_file(va) == va`, so every code path that
                 // does `structure_search_data()[va_to_file(va)..]` reads
                 // contiguous bytes across wasm data-segment boundaries -
                 // gaps are zero-fill in the reconstructed image.
-                let lm_len = image.len() as u64;
+                let lm_len = lm.image.len() as u64;
                 segments.push((0u64, 0u64, lm_len));
-                wasm_lm = Some(image.into_boxed_slice());
+                wasm_initialized_start = Some(lm.initialized_start);
+                wasm_lm = Some(lm.image.into_boxed_slice());
             }
         }
 
@@ -462,8 +482,19 @@ impl<'a> BinaryContext<'a> {
             elf_note_segments,
             image_base,
             wasm_lm,
+            wasm_initialized_start,
             rebased,
+            has_symbols,
         }
+    }
+
+    /// Whether the container's symbol table (ELF `.symtab`, Mach-O
+    /// `LC_SYMTAB`, PE COFF symbols) defines any symbol, one
+    /// [`crate::GoBinary::symbols`] yields: `false` for a stripped binary
+    /// (a stripped Mach-O keeps only its imports there) and for wasm, which
+    /// has no such table.
+    pub fn has_symbols(&self) -> bool {
+        self.has_symbols
     }
 
     /// Byte ranges of [`Self::data`] - i.e. **file** offsets - that can hold
@@ -515,14 +546,25 @@ impl<'a> BinaryContext<'a> {
     /// Mach-O, a rebased copy with identical layout), so the file ranges carry
     /// over unchanged. For wasm it is the reconstructed linear-memory image,
     /// whose offsets are linear-memory addresses unrelated to file positions -
-    /// and which is *entirely* initialized data, so there is nothing to
-    /// exclude.
+    /// and which is *entirely* initialized data or zero-fill, so there is
+    /// nothing to exclude.
     pub fn search_regions(&self) -> Vec<(usize, usize)> {
         if self.format == BinaryFormat::Wasm {
             let len = self.structure_search_data().len();
             return if len > 0 { vec![(0, len)] } else { Vec::new() };
         }
         self.data_regions()
+    }
+
+    /// The lowest linear-memory address a wasm data segment initializes.
+    /// `None` for every other format, and for a wasm module with no data.
+    ///
+    /// Go code does not live in linear memory, and the Go linker writes no
+    /// segment for a data section's leading zeros, so everything below this
+    /// address reads as zero-fill: the bytes of no string or other non-zero
+    /// value start there.
+    pub fn wasm_initialized_start(&self) -> Option<u64> {
+        self.wasm_initialized_start
     }
 
     /// The raw binary data this context was built from.
@@ -683,6 +725,29 @@ impl<'a> BinaryContext<'a> {
     }
 }
 
+/// An ELF read from its file header and program headers alone, for when
+/// goblin rejects the whole file over its section table (an offset past the
+/// end of the file, an impossible count). The kernel loads an ELF from its
+/// program headers and ignores the sections, so a binary whose section table
+/// was damaged, a common way to hinder analysis, still runs, and its address
+/// mapping and notes are all here. It has no sections and no symbols.
+fn elf_without_sections(data: &[u8]) -> Option<Elf<'_>> {
+    let header = Elf::parse_header(data).ok()?;
+    let ctx = Ctx {
+        container: header.container().ok()?,
+        le: header.endianness().ok()?,
+    };
+    let mut elf = Elf::lazy_parse(header).ok()?;
+    elf.program_headers = ProgramHeader::parse(
+        data,
+        usize::try_from(header.e_phoff).ok()?,
+        usize::from(header.e_phnum),
+        ctx,
+    )
+    .ok()?;
+    Some(elf)
+}
+
 /// Detect the binary format from the first 4 bytes (magic number).
 ///
 /// # Format Magic Bytes
@@ -717,6 +782,97 @@ pub fn detect_format(data: &[u8]) -> BinaryFormat {
             BinaryFormat::Wasm
         }
         _ => BinaryFormat::Unknown,
+    }
+}
+
+/// One architecture's image in a universal ("fat") Mach-O file: see
+/// [`macho_slices`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FatSlice {
+    /// The architecture its CPU type names; [`Arch::Unknown`] for one Go
+    /// does not target.
+    pub arch: Arch,
+    /// The raw Mach-O CPU type (`CPU_TYPE_ARM64` is `0x0100000c`).
+    pub cpu_type: u32,
+    /// The raw Mach-O CPU subtype, capability bits included.
+    pub cpu_subtype: u32,
+    /// Where the slice lies in the file: a thin Mach-O image, which
+    /// [`crate::GoBinary::parse`] reads as `&data[range]`.
+    pub range: Range<usize>,
+}
+
+/// The slices of a universal ("fat") Mach-O file, which `lipo` builds from
+/// thin Mach-O images of several architectures: `None` when `data` is not
+/// one.
+///
+/// The header is big-endian: magic `0xcafebabe` (`0xcafebabf` with 64-bit
+/// offsets), a slice count, then per slice its CPU type and subtype, file
+/// offset, size and alignment (`mach-o/fat.h`). Java class files share the
+/// `0xcafebabe` magic, so the header is accepted only when every slice lies
+/// in the file and starts with a thin Mach-O magic. Go's linker writes no
+/// fat files itself; they come from macOS packaging.
+pub fn macho_slices(data: &[u8]) -> Option<Vec<FatSlice>> {
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(
+            data.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let wide = match word(0)? {
+        0xcafe_babe => false,
+        0xcafe_babf => true,
+        _ => return None,
+    };
+    let count = usize::try_from(word(4)?).ok()?;
+    let entry = if wide { 32 } else { 20 };
+    if count == 0 {
+        return None;
+    }
+    // Every entry must lie in the file and frame a Mach-O image, so a
+    // hostile count ends at the first entry past the data.
+    let mut slices = Vec::new();
+    for i in 0..count {
+        let at = i.checked_mul(entry)?.checked_add(8)?;
+        let field = |n: usize| word(at.checked_add(n)?);
+        let (offset, size) = if wide {
+            let high = |n: usize| -> Option<u64> {
+                Some(u64::from(field(n)?) << 32 | u64::from(field(n.checked_add(4)?)?))
+            };
+            (
+                usize::try_from(high(8)?).ok()?,
+                usize::try_from(high(16)?).ok()?,
+            )
+        } else {
+            (field(8)? as usize, field(12)? as usize)
+        };
+        let range = offset..offset.checked_add(size)?;
+        if detect_format(data.get(range.clone())?) != BinaryFormat::MachO {
+            return None;
+        }
+        let cpu_type = field(0)?;
+        slices.push(FatSlice {
+            arch: macho_arch(cpu_type),
+            cpu_type,
+            cpu_subtype: field(4)?,
+            range,
+        });
+    }
+    Some(slices)
+}
+
+/// The architecture a Mach-O CPU type names (`mach/machine.h`).
+fn macho_arch(cpu_type: u32) -> Arch {
+    const X86: u32 = 7;
+    const X86_64: u32 = 0x0100_0007;
+    const ARM: u32 = 12;
+    const ARM64: u32 = 0x0100_000c;
+    const PPC64: u32 = 0x0100_0012;
+    match cpu_type {
+        X86 => Arch::X86,
+        X86_64 => Arch::X86_64,
+        ARM => Arch::Arm,
+        ARM64 => Arch::Arm64,
+        PPC64 => Arch::Ppc64,
+        _ => Arch::Unknown,
     }
 }
 

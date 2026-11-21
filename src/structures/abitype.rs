@@ -25,7 +25,7 @@
 //! Go 1.21; what changed in Go 1.27 is how `GCData` is populated - see
 //! [`TFLAG_GC_MASK_ON_DEMAND`].
 
-use crate::structures::util::{read_i32, read_u32, read_uintptr};
+use crate::util::{read_i32, read_u32, read_uintptr};
 
 /// `TFlag` bit: type has an `UncommonType` following the type-specific extra fields.
 pub const TFLAG_UNCOMMON: u8 = 0x01;

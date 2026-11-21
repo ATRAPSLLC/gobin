@@ -27,10 +27,12 @@
 
 use std::ops::Range;
 
-use crate::structures::{
-    PclntabVersion,
-    bounds::{BoundWord, TextBound},
-    goslice::{GoSlice, GoStr},
+use crate::{
+    structures::{
+        PclntabVersion,
+        bounds::{BoundWord, TextBound},
+        goslice::{GoSlice, GoStr},
+    },
     util::{advance, align_up, read_uintptr},
 };
 
@@ -105,6 +107,70 @@ impl TextSect {
     }
 }
 
+/// The address of the code at text offset `off`: the runtime's
+/// `moduledata.textAddr` (`src/runtime/symtab.go`).
+///
+/// `text` is `runtime.text`; `sections` the decoded `textsectmap`, consulted
+/// only when it has more than one entry, where the section holding `off`
+/// places it (`baseaddr + off - vaddr`; the last section also owns its end, the
+/// function table's `etext` sentinel). `indexed` marks a wasm text offset that
+/// is a function index (Go 1.25+), which becomes the PC `text + (off << 16)`.
+/// `None` on overflow.
+pub fn text_addr(text: u64, sections: &[TextSect], off: u32, indexed: bool) -> Option<u64> {
+    let off = u64::from(off);
+    if indexed {
+        return text.checked_add(off.checked_shl(16)?);
+    }
+    if sections.len() > 1 {
+        let last = sections.len().saturating_sub(1);
+        for (index, section) in sections.iter().enumerate() {
+            if (off >= section.vaddr && off < section.end) || (index == last && off == section.end)
+            {
+                return section
+                    .baseaddr
+                    .checked_add(off.checked_sub(section.vaddr)?);
+            }
+        }
+    }
+    text.checked_add(off)
+}
+
+/// The text offset of the code at address `pc`: the runtime's
+/// `moduledata.textOff` (`src/runtime/symtab.go`), the inverse of
+/// [`text_addr`] with the same parameters.
+///
+/// An indexed (wasm) PC inside a function yields that function's index. With
+/// several sections, a `pc` before a section's base or past the last one's end
+/// lies in no section and yields `None`, as it does when `pc` precedes `text`
+/// or the offset does not fit 32 bits.
+pub fn text_off(text: u64, sections: &[TextSect], pc: u64, indexed: bool) -> Option<u32> {
+    if indexed {
+        return u32::try_from(pc.checked_sub(text)? >> 16).ok();
+    }
+    if sections.len() <= 1 {
+        return u32::try_from(pc.checked_sub(text)?).ok();
+    }
+    let last = sections.len().saturating_sub(1);
+    for (index, section) in sections.iter().enumerate() {
+        if section.baseaddr > pc {
+            return None;
+        }
+        let mut end = section
+            .baseaddr
+            .checked_add(section.end.checked_sub(section.vaddr)?)?;
+        if index == last {
+            end = end.checked_add(1)?;
+        }
+        if pc < end {
+            let off = pc
+                .checked_sub(section.baseaddr)?
+                .checked_add(section.vaddr)?;
+            return u32::try_from(off).ok();
+        }
+    }
+    None
+}
+
 /// One entry of `moduledata.ptab` (`runtime.ptabEntry`) - an exported symbol of
 /// a Go plugin. Both fields are offsets relative to `moduledata.types`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +214,7 @@ impl Bitvector {
     /// Parse from raw bytes at `offset` (the `*byte` sits one pointer in).
     pub fn parse(data: &[u8], offset: usize, ps: u8) -> Option<Self> {
         Some(Self {
-            n: crate::structures::util::read_i32(data, offset)?,
+            n: crate::util::read_i32(data, offset)?,
             bytedata: read_uintptr(data, offset.checked_add(ps as usize)?, ps)?,
         })
     }
@@ -317,6 +383,12 @@ pub struct LayoutHints {
     /// Whether a `.go.type` / `__go_type` section was found. This one *is* a
     /// positive Go 1.27+ signal: the section did not exist before.
     pub has_go_type_section: bool,
+    /// Whether the code lives outside the data's address space, as on wasm,
+    /// whose functions are not in linear memory. Where it does not (ELF,
+    /// Mach-O, PE) the code precedes the data, so `text` bounds every data
+    /// address from below; on wasm `text` is `0` before Go 1.28 and `1 << 63`
+    /// from Go 1.28 on, and bounds nothing.
+    pub code_outside_data: bool,
 }
 
 impl LayoutHints {
@@ -349,6 +421,84 @@ impl LayoutHints {
     }
 }
 
+/// The fields both moduledata layouts share after their table slices.
+struct Bounds {
+    findfunctab: u64,
+    minpc: u64,
+    maxpc: u64,
+    text: u64,
+    etext: u64,
+    noptrdata: VaRange,
+    data: VaRange,
+    bss: VaRange,
+    noptrbss: VaRange,
+}
+
+impl Bounds {
+    /// Read the bounds at `*off`, advancing it past them: `findfunctab`, the
+    /// PC range, `text`/`etext` and the four data ranges.
+    ///
+    /// `None` unless they hold what the Go linker always writes: `text <=
+    /// minpc < maxpc`, and no data range ending before it starts. A run of
+    /// pointer-sized words that only resembles a moduledata fails it: on a
+    /// position-independent ELF, the `.rela.dyn` entry that relocates the
+    /// `pcHeader` field holds the pclntab address as its addend, followed by
+    /// more `(offset, R_X86_64_RELATIVE, addend)` triples. Section-guided
+    /// searches never look there, but a binary whose section table is damaged
+    /// is scanned from the start of the image.
+    ///
+    /// The data ranges are not checked against each other (an externally
+    /// linked binary interleaves them), nor `maxpc` against `etext` (on wasm
+    /// they count in different units).
+    fn read(data: &[u8], off: &mut usize, ps: u8) -> Option<Self> {
+        let mut word = || {
+            let value = read_uintptr(data, *off, ps)?;
+            *off = advance(*off, usize::from(ps))?;
+            Some(value)
+        };
+        let findfunctab = word()?;
+        let minpc = word()?;
+        let maxpc = word()?;
+        let text = word()?;
+        let etext = word()?;
+        if !(text <= minpc && minpc < maxpc) {
+            return None;
+        }
+        let bounds = Bounds {
+            findfunctab,
+            minpc,
+            maxpc,
+            text,
+            etext,
+            noptrdata: read_range(data, off, ps)?,
+            data: read_range(data, off, ps)?,
+            bss: read_range(data, off, ps)?,
+            noptrbss: read_range(data, off, ps)?,
+        };
+        [bounds.noptrdata, bounds.data, bounds.bss, bounds.noptrbss]
+            .iter()
+            .all(|range| range.start <= range.end)
+            .then_some(bounds)
+    }
+}
+
+/// Read the `(start, end)` address pair at `*off`, advancing it.
+fn read_range(data: &[u8], off: &mut usize, ps: u8) -> Option<VaRange> {
+    let start = read_uintptr(data, *off, ps)?;
+    *off = advance(*off, usize::from(ps))?;
+    let end = read_uintptr(data, *off, ps)?;
+    *off = advance(*off, usize::from(ps))?;
+    Some(VaRange { start, end })
+}
+
+/// Read the table slice header at `*off`, advancing it. `None` when its
+/// length exceeds its capacity, which no slice the linker writes does.
+fn read_table(data: &[u8], off: &mut usize, ps: u8) -> Option<GoSlice> {
+    let slice = GoSlice::parse(data, *off, ps)?;
+    *off = advance(*off, GoSlice::size(ps))?;
+    (slice.len <= slice.cap).then_some(slice)
+}
+
 impl Moduledata {
     /// Parse a moduledata from raw bytes with version detection.
     ///
@@ -373,6 +523,12 @@ impl Moduledata {
     /// returns the first one that is internally self-consistent - see
     /// [`Moduledata::layout_self_consistent`]. Only if neither validates does
     /// the hint-preferred layout win, so callers still get the head fields.
+    ///
+    /// Either way the head must hold what the Go linker always writes, or
+    /// there is no moduledata here: `text <= minpc < maxpc`, no data range
+    /// ending before it starts, and table slices within their capacity. A
+    /// run of words that only resembles a moduledata, such as the relocation
+    /// table a position-independent ELF keeps for it, fails that.
     pub fn parse(data: &[u8], ps: u8, hints: LayoutHints) -> Option<Self> {
         // The Go 1.5-1.15 moduledata has an entirely different head and is
         // parsed separately; it has no V5/pre-V5 ambiguity.
@@ -387,7 +543,7 @@ impl Moduledata {
                 continue;
             }
             if let Some(md) = Self::parse_modern(data, ps, hints, v5)
-                && md.layout_self_consistent()
+                && md.layout_self_consistent(hints.code_outside_data)
             {
                 return Some(md);
             }
@@ -454,8 +610,11 @@ impl Moduledata {
     ///   picks up unrelated pointers as `typedesclen`/`itaboffset`, which then
     ///   dwarf the (collapsed) types span.
     /// - `rodata`, `gofunc` and `epclntab` are image addresses at or above
-    ///   `text`, never the small integers a misaligned read produces.
-    pub fn layout_self_consistent(&self) -> bool {
+    ///   `text`, never the small integers a misaligned read produces. This
+    ///   holds only where the code precedes the data in one address space,
+    ///   so it is skipped when `code_outside_data` (wasm: see
+    ///   [`LayoutHints::code_outside_data`]).
+    pub fn layout_self_consistent(&self, code_outside_data: bool) -> bool {
         let Some(span) = self.etypes.checked_sub(self.types) else {
             return false;
         };
@@ -480,10 +639,11 @@ impl Moduledata {
         }
         // A misaligned read lands on lengths, flags and slice fields, which
         // read as small integers rather than addresses inside the image.
-        [self.rodata, self.gofunc, self.epclntab]
-            .into_iter()
-            .flatten()
-            .all(|va| va >= self.text)
+        code_outside_data
+            || [self.rodata, self.gofunc, self.epclntab]
+                .into_iter()
+                .flatten()
+                .all(|va| va >= self.text)
     }
 
     /// Parse a Go 1.16+ moduledata with the layout fixed by `hints` and the
@@ -501,25 +661,13 @@ impl Moduledata {
         let pc_header = read_uintptr(data, off, ps)?;
         off = advance(off, p)?;
 
-        let funcnametab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let cutab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let filetab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let pctab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let pclntable = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let ftab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-
-        let findfunctab = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-        let minpc = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-        let maxpc = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
+        let funcnametab = read_table(data, &mut off, ps)?;
+        let cutab = read_table(data, &mut off, ps)?;
+        let filetab = read_table(data, &mut off, ps)?;
+        let pctab = read_table(data, &mut off, ps)?;
+        let pclntable = read_table(data, &mut off, ps)?;
+        let ftab = read_table(data, &mut off, ps)?;
+        let bounds = Bounds::read(data, &mut off, ps)?;
 
         // The middle/tail layout is determined per-field from the pclntab
         // magic and the Go minor version, verified against runtime/symtab.go
@@ -530,23 +678,6 @@ impl Moduledata {
         //   - epclntab                  : Go 1.26+ (absent in 1.24 / 1.25!)
         //   - V5 (typedesclen + itaboffset/itabsize, no typelinks/itablinks):
         //                                 Go 1.27+, chosen by the caller
-        let text = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-        let etext = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-
-        // Data-segment boundaries: four `(start, end)` VA pairs.
-        let read_range = |off: &mut usize| -> Option<VaRange> {
-            let start = read_uintptr(data, *off, ps)?;
-            *off = advance(*off, p)?;
-            let end = read_uintptr(data, *off, ps)?;
-            *off = advance(*off, p)?;
-            Some(VaRange { start, end })
-        };
-        let noptrdata = read_range(&mut off)?;
-        let data_seg = read_range(&mut off)?;
-        let bss = read_range(&mut off)?;
-        let noptrbss = read_range(&mut off)?;
 
         // `covctrs` sits *before* `types`, so its presence shifts every later
         // field; `rodata`/`gofunc` sit *after* `etypes`. They were added in
@@ -557,7 +688,7 @@ impl Moduledata {
 
         // covctrs, ecovctrs (Go 1.20+)
         let covctrs = if has_covctrs {
-            Some(read_range(&mut off)?)
+            Some(read_range(data, &mut off, ps)?)
         } else {
             None
         };
@@ -718,15 +849,15 @@ impl Moduledata {
             pctab,
             pclntable,
             ftab,
-            findfunctab,
-            minpc,
-            maxpc,
-            text,
-            etext,
-            noptrdata,
-            data: data_seg,
-            bss,
-            noptrbss,
+            findfunctab: bounds.findfunctab,
+            minpc: bounds.minpc,
+            maxpc: bounds.maxpc,
+            text: bounds.text,
+            etext: bounds.etext,
+            noptrdata: bounds.noptrdata,
+            data: bounds.data,
+            bss: bounds.bss,
+            noptrbss: bounds.noptrbss,
             end,
             gcdata,
             gcbss,
@@ -814,36 +945,11 @@ impl Moduledata {
 
         let mut off = 0usize;
 
-        // Head: pclntable, ftab, filetab slices; findfunctab, minpc, maxpc.
-        let pclntable = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let ftab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let filetab = GoSlice::parse(data, off, ps)?;
-        off = advance(off, slice_sz)?;
-        let findfunctab = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-        let minpc = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-        let maxpc = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-
-        let text = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-        let etext = read_uintptr(data, off, ps)?;
-        off = advance(off, p)?;
-
-        let read_range = |off: &mut usize| -> Option<VaRange> {
-            let start = read_uintptr(data, *off, ps)?;
-            *off = advance(*off, p)?;
-            let end = read_uintptr(data, *off, ps)?;
-            *off = advance(*off, p)?;
-            Some(VaRange { start, end })
-        };
-        let noptrdata = read_range(&mut off)?;
-        let data_seg = read_range(&mut off)?;
-        let bss = read_range(&mut off)?;
-        let noptrbss = read_range(&mut off)?;
+        // Head: the pclntable, ftab and filetab slices, then the bounds.
+        let pclntable = read_table(data, &mut off, ps)?;
+        let ftab = read_table(data, &mut off, ps)?;
+        let filetab = read_table(data, &mut off, ps)?;
+        let bounds = Bounds::read(data, &mut off, ps)?;
 
         let end = read_uintptr(data, off, ps)?;
         off = advance(off, p)?;
@@ -949,15 +1055,15 @@ impl Moduledata {
             pctab: GoSlice::default(),
             pclntable,
             ftab,
-            findfunctab,
-            minpc,
-            maxpc,
-            text,
-            etext,
-            noptrdata,
-            data: data_seg,
-            bss,
-            noptrbss,
+            findfunctab: bounds.findfunctab,
+            minpc: bounds.minpc,
+            maxpc: bounds.maxpc,
+            text: bounds.text,
+            etext: bounds.etext,
+            noptrdata: bounds.noptrdata,
+            data: bounds.data,
+            bss: bounds.bss,
+            noptrbss: bounds.noptrbss,
             end,
             gcdata,
             gcbss,
@@ -1027,12 +1133,17 @@ mod tests {
             go_minor,
             has_typelink_section: false,
             has_go_type_section: false,
+            code_outside_data: false,
         }
     }
 
     /// Write a little-endian `u64` at `off`.
     fn put(d: &mut [u8], off: usize, v: u64) {
         d[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn read_word(d: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
     }
 
     /// Field offsets of the 64-bit V5 (Go 1.27+) moduledata, counted from the
@@ -1051,10 +1162,9 @@ mod tests {
     }
 
     /// Field offsets of the 64-bit V3 (Go 1.20-1.25) moduledata. Identical to
-    /// V5 up to `types`, then diverges: no `typedesclen`, no itab fields.
+    /// V5 up to `types` (`text` and `etext` are [`v5_off`]'s), then diverges:
+    /// no `typedesclen`, no itab fields.
     mod v3_off {
-        pub const TEXT: usize = 176;
-        pub const ETEXT: usize = 184;
         pub const TYPES: usize = 296;
         pub const ETYPES: usize = 304;
         pub const RODATA: usize = 312;
@@ -1064,13 +1174,23 @@ mod tests {
         pub const TEXTSECTMAP_CAP: usize = 344;
     }
 
+    /// A zeroed 64-bit Go 1.16+ moduledata of `len` bytes but for a head
+    /// [`Moduledata::parse`] accepts: the PC range and `text`/`etext`, which
+    /// every modern layout keeps at the same offsets.
+    fn modern_head(len: usize) -> Vec<u8> {
+        let mut d = vec![0u8; len];
+        put(&mut d, 160, 0x401000); // minpc
+        put(&mut d, 168, 0x49fff1); // maxpc
+        put(&mut d, v5_off::TEXT, 0x401000);
+        put(&mut d, v5_off::ETEXT, 0x4a0000);
+        d
+    }
+
     /// A structurally plausible 64-bit V5 moduledata: every sub-region of
     /// `[types, etypes)` is in range and the segment pointers are real
     /// addresses, so [`Moduledata::layout_self_consistent`] accepts it.
     fn synthetic_v5() -> Vec<u8> {
-        let mut d = vec![0u8; 700];
-        put(&mut d, v5_off::TEXT, 0x401000);
-        put(&mut d, v5_off::ETEXT, 0x4a0000);
+        let mut d = modern_head(700);
         put(&mut d, v5_off::TYPES, 0x500000);
         put(&mut d, v5_off::TYPEDESCLEN, 0x1000);
         put(&mut d, v5_off::ETYPES, 0x520000);
@@ -1086,9 +1206,7 @@ mod tests {
     /// header at the position `epclntab` would occupy keeps the Go 1.26 probe
     /// on the V3 side when the minor version is unknown.
     fn synthetic_v3() -> Vec<u8> {
-        let mut d = vec![0u8; 700];
-        put(&mut d, v3_off::TEXT, 0x401000);
-        put(&mut d, v3_off::ETEXT, 0x4a0000);
+        let mut d = modern_head(700);
         put(&mut d, v3_off::TYPES, 0x4a2000);
         put(&mut d, v3_off::ETYPES, 0x4d9000);
         put(&mut d, v3_off::RODATA, 0x4a2000);
@@ -1104,7 +1222,7 @@ mod tests {
         // V2 moduledata needs enough space for the full prefix + version-specific section
         // Prefix: 1 ptr + 6 slices + 4 ptrs + 8 skipped ptrs = 1*8 + 6*24 + 4*8 + 8*8 = 248
         // V2 tail: 3 ptrs + 2 ptrs + 1 slice + 2 slices = 3*8 + 2*8 + 24 + 2*24 = 112
-        let data = vec![0u8; 400];
+        let data = modern_head(400);
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go116, None));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V2);
@@ -1114,7 +1232,7 @@ mod tests {
     fn version_detection_go118_is_v3_with_rodata() {
         // Go 1.18-1.19 (Go118 magic): rodata/gofunc present (V3), but no
         // covctrs. Distinct from the V2 (Go116) layout.
-        let data = vec![0u8; 500];
+        let data = modern_head(500);
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go118, Some(19)))
             .expect("Go118 moduledata should parse");
         assert_eq!(md.version, ModuledataVersion::V3);
@@ -1124,7 +1242,7 @@ mod tests {
 
     #[test]
     fn version_detection_go116_is_v2_no_rodata() {
-        let data = vec![0u8; 500];
+        let data = modern_head(500);
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go116, Some(16)))
             .expect("Go116 moduledata should parse");
         assert_eq!(md.version, ModuledataVersion::V2);
@@ -1133,7 +1251,7 @@ mod tests {
 
     #[test]
     fn version_detection_go120_minor_22() {
-        let data = vec![0u8; 500];
+        let data = modern_head(500);
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(22)));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V3);
@@ -1142,7 +1260,7 @@ mod tests {
     #[test]
     fn version_detection_go120_minor_25_is_v3_no_epclntab() {
         // Go 1.24 / 1.25 have NO epclntab field -> V3 layout, not V4.
-        let data = vec![0u8; 500];
+        let data = modern_head(500);
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(25)));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V3);
@@ -1151,7 +1269,7 @@ mod tests {
     #[test]
     fn version_detection_go120_minor_26_is_v4() {
         // epclntab was added in Go 1.26 -> V4.
-        let data = vec![0u8; 500];
+        let data = modern_head(500);
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(26)));
         assert!(md.is_some());
         assert_eq!(md.unwrap().version, ModuledataVersion::V4);
@@ -1179,7 +1297,7 @@ mod tests {
     #[test]
     fn v4_falls_back_to_typelinks_not_v5() {
         // minor 27 but a typelink section is present -> stay on V4 layout.
-        let data = vec![0u8; 600];
+        let data = modern_head(600);
         let md = Moduledata::parse(
             &data,
             8,
@@ -1188,6 +1306,7 @@ mod tests {
                 go_minor: Some(27),
                 has_typelink_section: true,
                 has_go_type_section: false,
+                code_outside_data: false,
             },
         )
         .expect("should parse");
@@ -1239,6 +1358,7 @@ mod tests {
                 go_minor: None,
                 has_typelink_section: true,
                 has_go_type_section: true,
+                code_outside_data: false,
             },
         )
         .expect("V5 moduledata should parse");
@@ -1258,10 +1378,93 @@ mod tests {
                 go_minor: None,
                 has_typelink_section: false,
                 has_go_type_section: true,
+                code_outside_data: false,
             },
         )
         .expect("should parse");
         assert_ne!(md.version, ModuledataVersion::V5);
+    }
+
+    /// The words a position-independent Go 1.27 ELF holds at the start of its
+    /// `.rela.dyn` relocation of the moduledata (`basic_go127_linux_amd64_pie`):
+    /// the `pcHeader` field's addend, the pclntab address, then
+    /// `(r_offset, R_X86_64_RELATIVE, r_addend)` triples, each relocating the
+    /// next moduledata word. Read as a moduledata they give `text` 0x594420
+    /// above `minpc` 8 and a `bss` that ends before it starts. The image scan
+    /// met these first once the section table was damaged.
+    #[test]
+    fn a_relocation_table_is_no_moduledata() {
+        let addends: [u64; 16] = [
+            0x4abe70, 0x4bec10, 0x4bf960, 0x4c0fe0, 0x501c60, 0x501c60, 0x549cc0, 0x401000,
+            0x49d7e1, 0x401000, 0x49d7f0, 0x5945c0, 0x59ab82, 0x59aba0, 0x59f732, 0x59f740,
+        ];
+        let mut d = vec![0u8; 700];
+        put(&mut d, 0, 0x4abe20);
+        for (i, addend) in addends.into_iter().enumerate() {
+            let at = 8 + 24 * i;
+            put(&mut d, at, 0x594388 + 24 * i as u64);
+            put(&mut d, at + 8, 8);
+            put(&mut d, at + 16, addend);
+        }
+        for minor in [Some(25), Some(27), None] {
+            assert!(Moduledata::parse(&d, 8, hints(PclntabVersion::Go120, minor)).is_none());
+        }
+    }
+
+    /// Each rule the head is held to, broken alone on an otherwise accepted
+    /// record, in both the modern and the legacy (Go 1.5-1.15) layout.
+    #[test]
+    fn a_head_breaking_any_rule_is_no_moduledata() {
+        // Offsets of the 64-bit modern head (after `pcHeader` and six slice
+        // headers) and the legacy one (after three).
+        const MODERN: usize = 152;
+        const LEGACY: usize = 72;
+        let legacy_head = || {
+            let mut d = vec![0u8; 512];
+            put(&mut d, LEGACY + 8, 0x1000); // minpc
+            put(&mut d, LEGACY + 16, 0x1ff0); // maxpc
+            put(&mut d, LEGACY + 24, 0x1000); // text
+            put(&mut d, LEGACY + 32, 0x2000); // etext
+            d
+        };
+        // The first table slice's length: `funcnametab` after `pcHeader`,
+        // `pclntable` at the start of the legacy record.
+        let layouts: [(Vec<u8>, usize, usize, LayoutHints); 2] = [
+            (
+                modern_head(500),
+                MODERN,
+                16,
+                hints(PclntabVersion::Go120, Some(25)),
+            ),
+            (
+                legacy_head(),
+                LEGACY,
+                8,
+                hints(PclntabVersion::Go12, Some(10)),
+            ),
+        ];
+        for (head, at, slice_len, hints) in layouts {
+            assert!(Moduledata::parse(&head, 8, hints).is_some());
+            let minpc = at + 8;
+            let maxpc = at + 16;
+            let text = at + 24;
+            let bss_start = at + 56;
+            let broken: [(&str, usize, u64); 4] = [
+                ("text above minpc", text, 0x1_0000_0000),
+                ("empty PC range", maxpc, read_word(&head, minpc)),
+                ("bss ending before it starts", bss_start, 1),
+                ("a table slice longer than its capacity", slice_len, 1),
+            ];
+            for (rule, field, value) in broken {
+                let mut d = head.clone();
+                put(&mut d, field, value);
+                assert!(
+                    Moduledata::parse(&d, 8, hints).is_none(),
+                    "{rule} ({:?})",
+                    hints.pclntab_version
+                );
+            }
+        }
     }
 
     #[test]
@@ -1276,7 +1479,7 @@ mod tests {
         let md = Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(27)))
             .expect("should still parse");
         assert_eq!(md.version, ModuledataVersion::V5);
-        assert_eq!(md.minpc, 0);
+        assert_eq!(md.minpc, 0x401000);
     }
 
     #[test]
@@ -1460,5 +1663,71 @@ mod tests {
     fn too_short_returns_none() {
         let data = vec![0u8; 10];
         assert!(Moduledata::parse(&data, 8, hints(PclntabVersion::Go120, Some(25))).is_none());
+    }
+
+    /// Two text sections the way a split link lays them out: the second
+    /// starts at offset 0x8000 from `runtime.text` but is placed 0x1000 past
+    /// the first one's end, so its offsets do not simply add to `text`.
+    fn split_sections() -> [TextSect; 2] {
+        [
+            TextSect {
+                vaddr: 0,
+                end: 0x8000,
+                baseaddr: 0x40_1000,
+            },
+            TextSect {
+                vaddr: 0x8000,
+                end: 0x9000,
+                baseaddr: 0x40_a000,
+            },
+        ]
+    }
+
+    #[test]
+    fn text_offsets_are_placed_by_their_section() {
+        let sections = split_sections();
+        let text = 0x40_1000;
+        // One section, or none decoded: the offset adds to `text`.
+        assert_eq!(
+            text_addr(text, &sections[..1], 0x8800, false),
+            Some(0x40_9800)
+        );
+        assert_eq!(text_addr(text, &[], 0x10, false), Some(0x40_1010));
+        // Split: the second section places its offsets at its own base.
+        assert_eq!(text_addr(text, &sections, 0x7fff, false), Some(0x40_8fff));
+        assert_eq!(text_addr(text, &sections, 0x8000, false), Some(0x40_a000));
+        // The last section owns its end: the function table's etext sentinel.
+        assert_eq!(text_addr(text, &sections, 0x9000, false), Some(0x40_b000));
+        for off in [0, 0x10, 0x7fff, 0x8000, 0x8abc, 0x9000] {
+            let pc = text_addr(text, &sections, off, false).unwrap();
+            assert_eq!(text_off(text, &sections, pc, false), Some(off), "{off:#x}");
+        }
+        // The gap between the sections and the space past the last one are in
+        // no section.
+        assert_eq!(text_off(text, &sections, 0x40_9800, false), None);
+        assert_eq!(text_off(text, &sections, 0x40_b001, false), None);
+        assert_eq!(text_off(text, &sections, 0x40_0fff, false), None);
+    }
+
+    #[test]
+    fn wasm_function_indices_become_pcs() {
+        // Go 1.25-1.27: `text` is 0 and the PC is the index shifted up.
+        assert_eq!(text_addr(0, &[], 0x1666, true), Some(0x1666_0000));
+        // Go 1.28: `text` carries the high bit.
+        let text = 1 << 63;
+        assert_eq!(
+            text_addr(text, &[], 0x63c, true),
+            Some(0x8000_0000_063c_0000)
+        );
+        // A resume point inside a function names the function.
+        assert_eq!(
+            text_off(text, &[], 0x8000_0000_063c_0007, true),
+            Some(0x63c)
+        );
+        assert_eq!(text_off(0, &[], 0x1666_0000, true), Some(0x1666));
+        // A data address below the code's PCs is no text offset.
+        assert_eq!(text_off(text, &[], 0x3000, true), None);
+        // An index too large to shift into a PC overflows rather than wraps.
+        assert_eq!(text_addr(u64::MAX, &[], 1, true), None);
     }
 }

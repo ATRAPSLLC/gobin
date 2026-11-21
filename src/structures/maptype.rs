@@ -58,7 +58,7 @@
 //! which gives `Map => CommonSize + 10*ptrSize + 4 (+4 padding when
 //! ptrSize == 8)`.
 
-use crate::structures::util::{read_u16, read_u32, read_uintptr};
+use crate::util::{read_u16, read_u32, read_uintptr};
 
 /// Which `abi` map-descriptor layout a binary uses.
 ///

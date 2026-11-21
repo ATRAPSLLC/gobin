@@ -12,7 +12,7 @@
 //!
 //! Source: `src/internal/abi/type.go:358-368`
 
-use crate::structures::util::read_u16;
+use crate::util::read_u16;
 
 /// Parsed extra fields for a function type descriptor.
 #[derive(Debug, Clone, Copy, Default)]

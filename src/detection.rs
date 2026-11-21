@@ -23,7 +23,11 @@
 //! | `Medium` | Build info or version string found                          |
 //! | `High`   | Structural proof: pclntab magic, section names, or build ID |
 
-use crate::structures::PclntabVersion;
+use crate::structures::{
+    PclntabVersion, itab::ItabLayout, locate::ModuledataSource, maptype::MapLayout,
+    moduledata::ModuledataVersion,
+};
+use crate::{formats::FatSlice, util::find_bytes};
 
 /// Confidence level for Go binary identification.
 ///
@@ -161,10 +165,9 @@ pub enum ConfidenceSignal {
         /// Short, static reason string.
         reason: &'static str,
     },
-    /// A Go version string was located.
+    /// A Go version string was located; [`crate::GoBinary::go_version`]
+    /// holds it.
     GoVersionString {
-        /// The version string (e.g. `"go1.26.1"`).
-        version: String,
         /// Where the version was sourced from.
         source: VersionSource,
     },
@@ -173,6 +176,47 @@ pub enum ConfidenceSignal {
         /// Number of distinct patterns matched.
         hits: usize,
     },
+    /// The moduledata was found: the layout it was read with, and how.
+    ModuledataLocated {
+        /// Its layout.
+        version: ModuledataVersion,
+        /// How it was found.
+        source: ModuledataSource,
+    },
+    /// No moduledata was found (Go 1.2-1.4 have none): types, itabs, init
+    /// tasks and code addresses are unavailable.
+    ModuledataMissing,
+    /// The layouts the version-dependent records are read with, and what
+    /// fixed them.
+    LayoutsChosen {
+        /// The itab record's.
+        itab: ItabLayout,
+        /// The map type descriptor's; `None` without a pclntab.
+        map: Option<MapLayout>,
+        /// Whether a text offset names a function by its index (wasm from
+        /// Go 1.25) rather than by its PC offset.
+        text_offsets_indexed: bool,
+        /// What fixed them.
+        decided_by: LayoutEvidence,
+    },
+    /// The container's symbol table defines symbols
+    /// ([`crate::GoBinary::symbols`] reads them).
+    SymbolTable,
+    /// The container's symbol table defines no symbol: linked with
+    /// `-ldflags=-s`, or stripped after (a stripped Mach-O keeps only its
+    /// imports). Not reported for wasm, which has no such table.
+    SymbolTableStripped,
+}
+
+/// What fixed the layouts gobin reads a binary's version-dependent records
+/// with ([`ConfidenceSignal::LayoutsChosen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutEvidence {
+    /// The Go version the binary records.
+    VersionString,
+    /// The binary's structure (the pclntab, `_func` and moduledata layouts),
+    /// for a binary whose version is unknown.
+    Structure,
 }
 
 /// Where a Go version string was extracted from.
@@ -180,6 +224,10 @@ pub enum ConfidenceSignal {
 pub enum VersionSource {
     /// Parsed from the structured build info blob.
     BuildInfoBlob,
+    /// Read from a wasm module's `producers` custom section, which records
+    /// the toolchain version in full
+    /// ([`crate::structures::wasm::go_producer_version`]).
+    WasmProducers,
     /// Found by scanning binary data for `go1.<digits>` patterns.
     StringScan,
 }
@@ -196,6 +244,14 @@ pub enum ParseError {
         /// The detection report at the point of failure.
         report: ConfidenceReport,
     },
+    /// A universal ("fat") Mach-O file: several thin images, one per
+    /// architecture, which [`crate::GoBinary`] reads one at a time. Parse
+    /// each slice's bytes, `&data[slice.range.clone()]`
+    /// ([`crate::formats::macho_slices`]).
+    Universal {
+        /// The slices, in the order the header lists them.
+        slices: Vec<FatSlice>,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -208,6 +264,11 @@ impl std::fmt::Display for ParseError {
                     report.signals.len()
                 )
             }
+            Self::Universal { slices } => write!(
+                f,
+                "a universal Mach-O file of {} slices: parse each slice",
+                slices.len()
+            ),
         }
     }
 }
@@ -253,65 +314,4 @@ pub fn heuristic_hits(data: &[u8]) -> usize {
         .iter()
         .filter(|p| find_bytes(data, p).is_some())
         .count()
-}
-
-/// Find the first occurrence of `needle` in `haystack`.
-///
-/// Uses a simple sliding-window scan. For the sizes we deal with (binaries up to
-/// ~100MB, needles of 10-40 bytes), this is fast enough and avoids pulling in a
-/// heavier substring search dependency.
-pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let (first, rest) = needle.split_first()?;
-    // Anchor on the first byte, then compare the tail only at candidates.
-    // `windows(n).position` compares every candidate window in full, which is
-    // the dominant cost of the whole-image searches PE and wasm binaries force
-    // when there is no section to narrow them to.
-    let last_start = haystack.len().checked_sub(needle.len())?;
-    let mut from = 0usize;
-    while from <= last_start {
-        let window = haystack.get(from..)?;
-        let hit = find_byte(window, *first)?;
-        let start = from.checked_add(hit)?;
-        if start > last_start {
-            return None;
-        }
-        let tail_start = start.checked_add(1)?;
-        let tail_end = tail_start.checked_add(rest.len())?;
-        if haystack.get(tail_start..tail_end) == Some(rest) {
-            return Some(start);
-        }
-        from = tail_start;
-    }
-    None
-}
-
-/// Index of the first occurrence of `byte` in `haystack`.
-///
-/// Eight bytes are tested per iteration with the classic SWAR zero-byte trick:
-/// XOR-ing the word against a broadcast of the target turns "contains `byte`"
-/// into "contains a zero byte", which `(x - 0x01..01) & !x & 0x80..80` answers
-/// in three instructions. A byte-at-a-time `position` is roughly an order of
-/// magnitude slower over the megabyte-scale buffers this crate searches, and
-/// pulling in a `memchr` dependency for it is not worth the supply-chain
-/// surface on a crate that otherwise depends only on `goblin`.
-fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
-    const LANES: usize = 8;
-    const LOW: u64 = 0x0101_0101_0101_0101;
-    const HIGH: u64 = 0x8080_8080_8080_8080;
-
-    let broadcast = u64::from_ne_bytes([byte; LANES]);
-    let (words, tail) = haystack.as_chunks::<LANES>();
-    for (i, chunk) in words.iter().enumerate() {
-        let x = u64::from_ne_bytes(*chunk) ^ broadcast;
-        if x.wrapping_sub(LOW) & !x & HIGH == 0 {
-            continue;
-        }
-        let base = i.checked_mul(LANES)?;
-        let hit = chunk.iter().position(|&b| b == byte)?;
-        return base.checked_add(hit);
-    }
-    let consumed = haystack.len().checked_sub(tail.len())?;
-    tail.iter()
-        .position(|&b| b == byte)
-        .and_then(|hit| consumed.checked_add(hit))
 }

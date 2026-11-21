@@ -32,7 +32,7 @@
 //! **not** recoverable by this scanner. Only the `embed.FS` (multi-file) form
 //! is supported.
 
-use crate::{formats::BinaryContext, structures::util::read_uintptr};
+use crate::{formats::BinaryContext, util::read_uintptr};
 
 /// One asset recovered from an `embed.FS`.
 #[derive(Debug, Clone, PartialEq, Eq)]
