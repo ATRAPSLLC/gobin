@@ -5,6 +5,327 @@ All notable changes to `gobin` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0]
+
+Per-function data and source spans for every Go version, methods and itabs
+resolved to their functions, the container's symbol table, runtime hooks,
+coverage metadata, universal Mach-O files, Go 1.28 (tip) support, and fixes
+found by new fuzz targets. Verified against go1.27.4 (no layout change since
+1.27.1) and Go tip at `2dbf8b413a`.
+
+### Added
+
+- **Per-function data blocks and per-PC tables, decoded for every Go
+  version** (`structures::funcdata`): `GoBinary::funcdata(&f, kind)` (a
+  block's address) and `GoBinary::pcdata(&f, kind)` (a table), with the
+  `FUNCDATA`/`PCDATA` indices of each release (`FuncDataKind::index`,
+  `PcDataKind::index`: renumbered in Go 1.13 and 1.16), and typed decoders:
+  - `GoBinary::wrapped_function` (`WrapInfo`, Go 1.18+): what a method value,
+    interface or `go`-statement wrapper calls.
+  - `GoBinary::arg_layout` (`ArgInfo`, Go 1.17+): the arguments a traceback
+    prints, with offsets, sizes and aggregates (`ArgLayout`, `ArgItem`).
+  - `GoBinary::open_defers` (`OpenCodedDeferInfo`, Go 1.14+), in its three
+    formats (`OpenDefers::Listed` with saved arguments through Go 1.17 and
+    closure slots through Go 1.21, `OpenDefers::Slots` from Go 1.22).
+  - `GoBinary::stack_objects` (`StackObjects`, Go 1.12+): addressable locals
+    with their type (Go 1.12-1.16) or size and pointer layout (Go 1.17+).
+  - `GoBinary::pointer_maps` (GC pointer maps, borrowed): one per safe point,
+    in the four formats Go has used (`PointerMapFormat`, `WordKind`).
+  Block references are pointers through Go 1.17, aligned as the runtime
+  aligns them, and `gofunc` offsets from Go 1.18. Where a binary states no
+  version, a format is decoded only if every version its structure allows
+  shares it.
+- **Universal ("fat") Mach-O files**: `formats::macho_slices` lists the
+  thin images `lipo` combined (`FatSlice`: architecture, raw CPU type and
+  subtype, byte range), each parsed as `GoBinary::parse(&data[range])`. The
+  32- and 64-bit headers are read; a Java class file, which shares the
+  `0xcafebabe` magic, is not taken for one. Fixtures
+  `basic_go128_darwin_amd64` and `basic_go128_darwin_universal` (that image
+  and `basic_go128_darwin_arm64`).
+- **Coverage metadata of `-cover` builds** (Go 1.20+,
+  `structures::coverage`): `GoBinary::coverage` decodes each instrumented
+  package's metadata (package, module, files, and each function's coverable
+  units: source extent and statement count of every counted block), found
+  through the symbol table. For a stripped build, a disassembler reads the
+  blob's address off the package's registration call
+  (`HookKind::CoverageRegistration`, `runtime.addCovMeta`) and
+  `GoBinary::coverage_meta_at` decodes it; `CounterMode::from_raw` and
+  `CounterGranularity::from_raw` read the call's mode and granularity, and
+  `CoverageFunction::unit_for_slot` maps a counter-variable slot to its unit.
+  `CoveragePackage::parse` decodes a blob from bytes.
+- Fixtures `basic_go120_linux_amd64_cover` (the format's first release),
+  `deps_go128_linux_amd64_cover` (two instrumented packages of a module) and
+  its stripped twin.
+- **Runtime hooks** (`GoBinary::runtime_hooks`, `metadata::HookKind`,
+  `RuntimeHook`): the runtime and `syscall` functions the compiler lowers
+  `go`, channel operations, `select`, `defer`, `panic`/`recover`, cgo calls
+  and system calls to, found in the binary, so a disassembler can mark those
+  operations at their call sites. A cgo binary's generated C-call stubs
+  (`pkg._Cfunc_<name>`) are hooks too, named for the C function each calls.
+- **The container's symbol table** (`GoBinary::symbols`, re-exported
+  `Symbols`, `Symbol`, `SymbolKind`): the functions and globals the Go linker
+  named on ELF, Mach-O and PE, with addresses, sizes (recorded on ELF, derived
+  from the next symbol on Mach-O and PE) and whether each is code, data, bss
+  or read-only; `Symbols::at(va)` finds the global an address belongs to.
+  `BinaryContext::has_symbols` says whether a table defines any.
+- **`GoBinary::go_experiments`**: the `GOEXPERIMENT` changes the version
+  string records after ` X:` (`arenas`, `nogreenteagc`), read without build
+  info from the runtime's own copy of its version
+  (`buildinfo::version_experiments`, `buildinfo::find_version_experiments`).
+- **`GoBinary::build_paths`** (`metadata::BuildPaths`): GOROOT, the module
+  cache, GOPATH, the main package's directory and the home directory an
+  untrimmed build records, each read off where a package's import path puts
+  its files.
+- **`GoBinary::build_id_source`**: where the build ID is recorded (the ELF
+  note, or a marker blob with its file range), and **`GoBinary::map_layout`**:
+  the map type descriptor layout the types are read with.
+- **The detection report states what the parse decided**
+  (`ConfidenceSignal::ModuledataLocated`, `ModuledataMissing`,
+  `LayoutsChosen` with `LayoutEvidence`, `SymbolTable`,
+  `SymbolTableStripped`), and `LocatedModuledata::source`
+  (`ModuledataSource`) how the moduledata was found. Presence of a symbol
+  table is decided at the first defined symbol, so the parse costs the same.
+- Fixture `deps_go128_linux_amd64`: an untrimmed module-mode build with a
+  dependency from the module cache and two experiments.
+- **Methods and itabs resolved to their functions.**
+  `GoBinary::method_functions(&method)` gives the functions a type's method
+  runs when called directly and through an interface (`MethodFunctions`), and
+  `GoBinary::itab_methods` now pairs each interface method's name with the
+  function its itab word binds it to (`ItabMethod`). Only a function's exact
+  entry resolves, and a method the linker dropped resolves to
+  `runtime.unreachableMethod`, as the runtime runs it.
+- **A function's own source span** (`ParsedPclntab::own_code`, `OwnCode`):
+  the file and lines of its own code, leaving out the code inlined into it,
+  read from its inline-tree index table (`ParsedPclntab::inline_index_table`,
+  whose slot `ParsedPclntab::inline_index_pcdata` names per Go version).
+- `InlineEntry` gains `source_file`, the inlined function's own file, and
+  gives `call_file`, `call_line` and `parent` for Go 1.20+ too, read from the
+  enclosing function's tables at `parent_pc` as the runtime's unwinder reads
+  them.
+- `InlineEntry` gains `parent`, `call_file` and `call_line` (Go 1.9-1.19,
+  which record the call site); `parent_pc` and `start_line` are `Option`s, and
+  `func_id` is a `FuncId`.
+- `LegacyFuncLayout::FramePlaceholder` (Go 1.5-1.9, the linker's
+  `0x1234567`) and `LEGACY_FRAME_PLACEHOLDER`; `FrameSize` is now Go 1.2-1.4.
+- `ParsedPclntab::funcdata_slots`.
+- `GoBinary::function_at(pc)`, the function whose code holds an address (an
+  entry, a return address, a wasm resume point), found the way the runtime's
+  `findfunc` does: a binary search of the sorted function table
+  (`ParsedPclntab::func_containing`), with no index built.
+- `FuncId` (`structures::pclntab`) and `FunctionInfo::func_id`: what a
+  function's funcID marks it as (a runtime special such as `Goexit` or
+  `RuntimeMain`, a `Wrapper`, or `Unknown(raw)`), and
+  `FunctionInfo::is_wrapper`. The raw numbers are renumbered between Go
+  versions, so `FuncId::classify` reads them the way the compiler assigns
+  them: the binary's wrapper ID (`ParsedPclntab::wrapper_func_id`, the highest
+  in its function table) is a wrapper whatever the name, and any other nonzero
+  ID is the special its `runtime.` name names. Checked against every Go
+  release's own list, Go 1.10 to tip.
+- `FunctionInfo::from_func`, the one constructor every function view goes
+  through.
+- `LegacyFuncLayout` (`ParsedPclntab::legacy_func`), what a Go 1.2-1.15
+  `_func` holds in the slots that changed meaning under one pclntab magic
+  (see Fixed).
+- `GoBinary::text_addr` and `GoBinary::text_off`, the runtime's
+  `moduledata.textAddr` / `textOff`: a text offset (a function's `entry_off`,
+  a method's `ifn`/`tfn`) to the PC code pointers hold, and back. They place
+  an offset by its text section when the linker split the code, and follow
+  wasm's encodings (below). The math is `moduledata::text_addr` /
+  `moduledata::text_off`.
+- `BuildInfo::cgo_mode` and `CgoMode`: `CGO_ENABLED=0`, `1`, or Go 1.28's
+  `bindings` (replacing `cgo_enabled`, see below).
+- `BuildInfo::vendored` (`-mod=vendor`, recorded from Go 1.28) and
+  `BuildInfo::vcs_time`.
+- `GoBinary::itab_layout` and `itab::ItabLayout`, the four shapes of an itab
+  record (see Fixed).
+- `BinaryContext::wasm_initialized_start`, the lowest address a wasm data
+  segment initializes; `wasm::LinearMemory` (built by `LinearMemory::assemble`),
+  the image with that address; `wasm::go_producer_version`, the toolchain version a
+  wasm module's `producers` section records.
+- `VersionSource::WasmProducers`.
+- Test corpus: `go128` fixtures built from Go tip (`build.sh` takes the
+  toolchain from `$GOTIP_ROOT`, and skips the tag without one), including the
+  first `js/wasm` and `CGO_ENABLED=bindings` fixtures; `linux/386` fixtures
+  for `go121`, `go123` and `go128`, and a version-scrubbed `go121` 386 copy.
+- Fuzz targets (`fuzz/`, cargo-fuzz on nightly, run locally and not in CI):
+  `parse` (arbitrary bytes), `decoders` (the standalone blob decoders) and
+  `mutate` (fixtures with byte patches aimed at their Go structures). Each
+  calls every public accessor on what it parses.
+
+### Fixed
+
+- **ELF binaries with a damaged section table.** The kernel loads an ELF from
+  its program headers and ignores the sections, so corrupting the section
+  header offset or count is a common way to hinder analysis. goblin rejects
+  such a file outright, which left no address mapping and no moduledata (Go
+  1.10 with `e_shoff` past the end of the file, for one). It is now read from
+  its file header and program headers alone.
+- **A relocation table taken for the moduledata.** Without usable sections
+  the moduledata is found by scanning the image from its start, which on a
+  position-independent ELF meets `.rela.dyn` first: the relocation of the
+  moduledata's `pcHeader` field carries the pclntab address as its addend,
+  among more `(offset, R_X86_64_RELATIVE, addend)` triples that passed for a
+  moduledata. `text` came out as 0x594420 instead of 0x401000, so every
+  function address was wrong, and a 5.8 million entry `textsectmap` made
+  `functions()` about 30 times slower. `Moduledata::parse` now returns `None`
+  for a record whose head breaks what the Go linker always writes (`text <=
+  minpc < maxpc`, no reversed data range, table slices within their
+  capacity), so the scan moves on to the real record. Found by the `mutate` fuzz target;
+  every ELF fixture is now tested with its section table damaged.
+
+- **Wasm strings on Go 1.28.** Go 1.28 moves wasm PCs to `1 << 63`. Before,
+  `runtime.text` was `0` and the string scan's "not in `[text, etext)`" filter
+  happened to cover linear memory below the data; with it gone, 1,247 of
+  3,050 strings on a tip `wasip1` module were small integer pairs resolving
+  into the zero-fill below the first data segment. String targets must now lie
+  at or above the first initialized byte.
+- **The moduledata layout check on Go 1.28 wasm.** Its "`rodata`, `gofunc`,
+  `epclntab` at or above `text`" rule only holds where code precedes data in
+  one address space; on tip wasm it rejected both layout candidates and the
+  choice fell back to a guess. It is skipped on wasm, where it never constrained
+  anything (`text` was `0`).
+- **Wasm code addresses, on every version.** `entry_va` returned `text +
+  entry_off`, which is no PC on wasm from Go 1.25 (a function-table entry is
+  then the function's index, and a PC `text + (index << 16)`), and
+  `init_order` named none of a wasm module's init functions. Both now go
+  through `text_addr` / `text_off`; whether a module's offsets are indices
+  (Go 1.25+) or PC offsets (before) is read from its function table.
+- **Itab records before Go 1.10, and on 32-bit before Go 1.23.** The method
+  words were read at `3*ptrSize` and the hash at `2*ptrSize` for every
+  version. Go 1.7-1.9 have a `link` word (and Go 1.9 its `hash` after it), so
+  the hash read as `0` and Go 1.9's method words were its hash; Go 1.10-1.22
+  pad `hash` to 8 bytes, which on 32-bit puts the methods one word later. A
+  version-scrubbed binary's layout is read from its structure.
+- **Development and pre-release version strings.** A wasm module's version
+  came from a `go1.` scan that cut `go1.28-devel_2dbf8b413a ...` to `go1.28`;
+  it is now read from the `producers` section. `runtime_commit` now reads the
+  `go1.N-devel_<hash>` form `cmd/dist` writes since Go 1.25 (it found only the
+  older `devel go1.N-<hash>`), the minor-version parse accepts that older
+  form, and the string scan keeps an `rc`/`beta` suffix.
+
+- **`has_cgo` was true for every binary.** It looked for `runtime.cgocall`,
+  which the runtime links from Go 1.7 with or without cgo. It now looks for
+  what only a cgo build holds: the generated C-call stubs, the runtime's
+  exports to C (`_cgo_panic`, `_cgo_topofstack`) and its cgo pointer check.
+  True for the three cgo fixtures and no other.
+- **Versionless binaries before Go 1.10 got the newest layouts.** Without a
+  version string, the itab and map type layouts fell back to Go 1.23's and Go
+  1.14's; they now come from every version the structure allows when those
+  agree (Go 1.2-1.4: the linked itab, the `hmap`-typed map).
+- `obfuscation` and `has_cgo` no longer decode every function's tables to
+  read their names.
+- **Line numbers on Go 1.20+ were doubled.** The line table holds absolute
+  lines in every Go version; gobin added the function's start line to each,
+  which Go 1.20 added to `_func` as the line of the `func` keyword (it read as
+  `0` before). `decode_pcln`, `line_range`, `end_line` and every per-PC line
+  were off by the function's start line.
+- **`end_line` and `source_file` counted code inlined into the function.**
+  `main.main` (lines 82-106) ended at line 1450, `fmt.Println`'s
+  `print.go` line, and a function whose first instruction was inlined code
+  took its callee's file. Both now cover the function's own code
+  (`OwnCode`); `ParsedPclntab::line_range` and `resolve_source_file` too.
+- **`decode_pcln_with_files` paired each line with the file before it.** It
+  gave a line step the file step ending at or before its end, so it dropped
+  the lines before the first file change and named the previous file at each
+  change. Its items now end wherever either table steps, each with the line
+  and file the runtime reads for those PCs.
+- **`for_each_function` resolved Go 1.2-1.15 files** through the Go 1.16+
+  compilation-unit table, so their `source_file` was wrong or missing.
+- **Type names kept the star their pointer type lends them.** The linker
+  stores `T`'s name as `*T`, shared with `*T`, and marks `T` to drop the star
+  (`tflagExtraStar`), which gobin never did: every named type that has a
+  pointer type read as one (`*main.TestStruct` for the struct), in
+  `GoType::name` and every type name resolved from a reference (struct
+  fields, parameters, map keys, method signatures).
+- **`GoType::is_exported` was always false.** It tested the first letter of
+  the qualified name (`main.Config`); it now follows Go: a named type whose
+  unqualified name is upper case.
+- **PC-value tables were read past their end.** A table ends with a zero
+  value delta (`runtime.step`); gobin stopped only on a zero PC delta, so it
+  read each terminator as "no change" and went on into the next table. Every
+  table went through this one decoder: line numbers, frame sizes, per-PC files
+  and the inline tree's index. The runtime's own check (a PC's stack-map index
+  names an existing map) failed on hundreds of functions per binary before;
+  it holds on every function of the corpus now.
+- **The inline tree, before Go 1.20.** It was read only where
+  `moduledata.gofunc` exists, and always as the Go 1.20 record, so Go 1.9-1.17
+  binaries had no inline tree and Go 1.18-1.19 records (20 bytes, with the
+  call site) were misread. It now decodes for Go 1.9 on, each record in its
+  version's shape (`inline::InlinedCallFormat`).
+- **FuncIDs named nothing.** `FunctionInfo::func_id_name` mapped raw values
+  80-100, which no Go version uses (real IDs are 0-23, renumbered between
+  versions), so it named no function, and `is_systemstack` (98, 99) matched
+  none. Replaced by `FuncId`.
+- **Go 1.2-1.15 `_func` records.** The word after `args` was read as
+  `deferreturn` for every version; it is the frame size in Go 1.2-1.4, a
+  `0x1234567` placeholder in Go 1.5-1.9 and the funcID in Go 1.10-1.11, so
+  `uses_defer` was true for nearly every function before Go 1.12. The funcID
+  (Go 1.10-1.15) and `nfuncdata` were never read. The layout is now read off
+  the function table itself.
+
+### Changed - breaking
+
+- `FunctionInfo` holds its `_func` record as `func: FuncData` instead of
+  copies of thirteen of its fields (`f.entry_offset` is `f.func.entry_off`,
+  `f.args_size` is `f.func.args`, `f.flags` is `f.func.flag`, and so on), and
+  gains `func_id: FuncId`.
+- `GoBinary::entry_va`, `entry_rva` and `inline_tree` take a
+  `&FunctionInfo`, the one per-function handle, instead of a `&FuncData`.
+- `FunctionInfo::func_id_name` is removed; `FunctionInfo::func_id` replaces it.
+- `ParsedPclntab` and `PclntabMeta` gain `legacy_func` and `wrapper_func_id`.
+- `inline::extract_iter` is replaced by `inline::InlineTreeIter::new`, which
+  takes the located block and index table; `InlineEntry::parent_pc` and
+  `start_line` are `Option`s and `func_id` is a `FuncId`.
+
+- `itab::extract_iter` and `itab::itab_methods` take an `ItabLayout`.
+- `ParseError` has a `Universal { slices }` variant: `GoBinary::try_parse` on
+  a universal Mach-O file returns it, naming the slices to parse, where it
+  read the first slice's tables without its addresses before.
+- `GoBinary::uses_concurrency` is removed: the runtime itself starts
+  goroutines and uses channels, so the functions it looked for are in every
+  binary (a program of one `println` has them) and it was always true. A
+  program's own use shows as calls to `GoBinary::runtime_hooks`.
+- `GoBinary::build_id_blob` is replaced by `GoBinary::build_id_source`
+  (`BuildIdSource::Marker { blob }` holds the range).
+- `BuildMode` and `CgoMode` borrow their unrecognised value from the binary
+  (`Other(&'a str)`, both `Copy`), and `as_str` returns `&str` instead of a
+  `Cow`.
+- `ConfidenceSignal::GoVersionString` no longer copies the version (it is
+  `GoBinary::go_version`), and `ConfidenceSignal` has the variants listed
+  under Added. `LocatedModuledata` has a `source` field.
+- `GoBinary::itab_methods` returns `Vec<ItabMethod>` (name, word, function)
+  instead of the raw words (`.va` is the old value).
+- `ParsedPclntab::decode_pcln` returns a `PcValueIter`; `PcLineIter`, which
+  only added the start line, is removed.
+- `ParsedPclntab::decode_pcln_with_files` splits its items wherever the line
+  or the file steps (each is `(pc_end, line, file)` for the PCs since the
+  previous item).
+- `FunctionInfo::source_file` and `end_line`, `ParsedPclntab::line_range` and
+  `resolve_source_file` describe the function's own code (see Fixed).
+- `ParsedPclntab` and `PclntabMeta` gain `inline_index_pcdata`.
+- `Moduledata::layout_self_consistent` takes `code_outside_data`, and
+  `LayoutHints` has a `code_outside_data` field.
+- `VersionSource` has a `WasmProducers` variant.
+- `BuildInfo::cgo_enabled` is removed; `BuildInfo::cgo_mode` replaces it
+  (`cgo_enabled() == Some(true)` is `cgo_mode() == Some(CgoMode::Enabled)`).
+  A `bool` cannot hold Go 1.28's third mode, `CGO_ENABLED=bindings`.
+- `wasm::build_linear_memory_image` is replaced by `wasm::LinearMemory::assemble`,
+  which returns the image together with its lowest initialized address
+  (`.image` is the old return value).
+
+### Changed
+
+- `GoBinary::laid_out_types` and `GoBinary::all_types` are 150 to 290 times
+  faster (816 ms to 2.8 ms on the slowest fixture), with the same output on
+  every fixture: the type-region scan checks a candidate descriptor's fixed
+  header fields before reading its name, methods and fields, instead of
+  building a full `GoType` at every pointer-aligned address.
+- `moduledata.textsectmap` is decoded once at parse instead of on every
+  `text_addr`, `text_off` and `entry_va` call.
+- CI: `actions/checkout` v4 -> v7.
+- Tests build at `opt-level = 1` (`[profile.test]`): the integration suite
+  runs in about 14 s instead of about 4 minutes, with overflow checks still on.
+
 ## [0.6.1]
 
 Types only code reaches, a fix for Go 1.17 type names, and string scanning
@@ -799,8 +1120,7 @@ Initial public release.
 - Type descriptor extraction via `.typelink` and descriptor walking.
 - Heuristic confidence scoring (`Confidence` enum).
 
-[0.6.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.1...v0.6.0
-[0.5.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.0...v0.5.1
+[0.7.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ATRAPSLLC/gobin/compare/v0.5.0...v0.5.1
