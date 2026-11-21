@@ -12,7 +12,7 @@
 //!
 //! Source: `src/internal/abi/type.go:347-356`
 
-use crate::structures::util::read_uintptr;
+use crate::util::read_uintptr;
 
 /// Parsed extra fields for a channel type descriptor.
 #[derive(Debug, Clone, Copy, Default)]

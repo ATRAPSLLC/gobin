@@ -7,18 +7,20 @@
 //!
 //! Source: `src/internal/abi/type.go:750-799`
 
-use crate::structures::{
-    abitype::AbiType,
-    arraytype::ArrayTypeExtra,
-    chantype::ChanTypeExtra,
-    elemtype::ElemTypeExtra,
-    functype::FuncTypeExtra,
-    interfacetype::InterfaceTypeExtra,
-    kind,
-    maptype::{MapLayout, MapTypeExtra},
-    method::{GoImethod, GoMethod},
-    structtype::{GoStructField, StructTypeExtra},
-    uncommon::UncommonType,
+use crate::{
+    structures::{
+        abitype::AbiType,
+        arraytype::ArrayTypeExtra,
+        chantype::ChanTypeExtra,
+        elemtype::ElemTypeExtra,
+        functype::FuncTypeExtra,
+        interfacetype::InterfaceTypeExtra,
+        kind,
+        maptype::{MapLayout, MapTypeExtra},
+        method::{GoImethod, GoMethod},
+        structtype::{GoStructField, StructTypeExtra},
+        uncommon::UncommonType,
+    },
     util::align_up,
 };
 

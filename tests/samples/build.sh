@@ -72,6 +72,13 @@ mkdir -p "$OUT" "$CACHE" "$WORK"
 #                 +itaboffset/itabsize); `.go.type`/`.go.func` sections;
 #                 abi.MapType gains the split-group stride fields; newest
 #                 stable anchor
+#   go128 tip     unreleased Go 1.28, built from a local tip toolchain (see
+#                 fetch_toolchain; skipped without one): wasm PCs move to
+#                 1<<63 (text no longer overlaps linear memory),
+#                 CGO_ENABLED=bindings, darwin records -buildmode=pie. The
+#                 checked-in go128 fixtures were built at tip commit
+#                 2dbf8b413a (2026-11-20); rebuild them from go1.28.0 once
+#                 it ships and pin the release here.
 # ---------------------------------------------------------------------------
 VERSIONS=(
   "go12:1.2.2"   "go14:1.4.3"   "go15:1.5.4"   "go17:1.7.6"   "go18:1.8.7"
@@ -79,22 +86,23 @@ VERSIONS=(
   "go115:1.15.15"
   "go116:1.16.15" "go117:1.17.13" "go118:1.18.10" "go120:1.20.14"
   "go121:1.21.13" "go123:1.23.12" "go124:1.24.13" "go125:1.25.11" "go126:1.26.4"
-  "go127:1.27.1"
+  "go127:1.27.1" "go128:tip"
 )
 
 # Anchor versions that get cross-compiled format variants. Mach-O/PE build from
 # any toolchain; darwin/arm64 needs >= 1.16; wasip1 needs >= 1.21.
-FORMAT_ANCHORS=("go116" "go120" "go124" "go126" "go127")
-WASIP1_ANCHORS=("go121" "go124" "go126" "go127")
+FORMAT_ANCHORS=("go116" "go120" "go124" "go126" "go127" "go128")
+WASIP1_ANCHORS=("go121" "go124" "go126" "go127" "go128")
 # Versions that get a `types` harness (the type system arrived in Go 1.7).
 # `go123` and `go126` bracket the two `abi.MapType` layout changes (buckets ->
 # Swiss in 1.24, Swiss -> split-group strides in 1.27), which the map-descriptor
 # stride assertions in `mod matrix` depend on.
 TYPES_VERSIONS=(
   "go17" "go110" "go111" "go112" "go113" "go116" "go120" "go123" "go126" "go127"
+  "go128"
 )
 # Versions that get a `generics` harness (type parameters arrived in Go 1.18).
-GENERICS_VERSIONS=("go118" "go120" "go124" "go126" "go127")
+GENERICS_VERSIONS=("go118" "go120" "go124" "go126" "go127" "go128")
 # Versions that get a `cgo` harness (linux/amd64, CGO_ENABLED=1 + host gcc).
 CGO_VERSIONS=("go116" "go126" "go127")
 
@@ -116,12 +124,13 @@ selected() {
 # Download + extract a toolchain into the cache (idempotent); echo its GOROOT.
 fetch_toolchain() {  # fetch_toolchain <full-version>
   local v="$1"
-  # An unreleased dev toolchain (for the *next* Go, when one is being tracked
-  # ahead of its release) can be bootstrapped into $HOME/sdk/gotip with
-  # `go install golang.org/dl/gotip@latest && gotip download`; the matrix uses
-  # released versions only, so this branch is normally unused.
+  # An unreleased dev toolchain (the *next* Go, tracked ahead of its release)
+  # is taken from $GOTIP_ROOT, else $HOME/sdk/gotip. Bootstrap one with
+  # `go install golang.org/dl/gotip@latest && gotip download`, or build a Go
+  # checkout's `src/make.bash` and point GOTIP_ROOT at the checkout.
   if [[ "$v" == "tip" ]]; then
-    [[ -x "$HOME/sdk/gotip/bin/go" ]] && echo "$HOME/sdk/gotip" || return 1
+    local tip="${GOTIP_ROOT:-$HOME/sdk/gotip}"
+    [[ -x "$tip/bin/go" ]] && echo "$tip" || return 1
     return 0
   fi
   local root="$CACHE/go$v"
@@ -137,7 +146,8 @@ ok=0; fail=()
 # build <tag> <ver> <prog> <goos> <goarch> <variant> [build args / KEY=VAL env]…
 build() {
   local tag=$1 ver=$2 prog=$3 goos=$4 goarch=$5 variant=$6; shift 6
-  local m; m="$(minor_of "$ver")"
+  local m
+  if [[ "$ver" == "tip" ]]; then m="$(minor_of "$tag")"; else m="$(minor_of "$ver")"; fi
   local name="${prog}_${tag}_${goos}_${goarch}${variant}"
   [[ "$goos" == "windows" ]] && name="${name}.exe"
   if [[ $list_only -eq 1 ]]; then echo "  $name"; return 0; fi
@@ -188,8 +198,15 @@ build() {
 [[ $list_only -eq 0 ]] && echo "Building fixtures into $OUT (linux host, go.dev toolchains)…"
 
 for entry in "${VERSIONS[@]}"; do
-  tag="${entry%%:*}"; ver="${entry##*:}"; m="$(minor_of "$ver")"
+  tag="${entry%%:*}"; ver="${entry##*:}"
+  if [[ "$ver" == "tip" ]]; then m="$(minor_of "$tag")"; else m="$(minor_of "$ver")"; fi
   selected "$tag" || continue
+  # The unreleased tag needs a local tip toolchain; without one it is skipped
+  # rather than failed, so a plain rebuild works on any host.
+  if [[ "$ver" == "tip" && $list_only -eq 0 ]] && ! fetch_toolchain tip >/dev/null; then
+    echo "  (skipping $tag: no tip toolchain; set GOTIP_ROOT)"
+    continue
+  fi
 
   # Backbone: every version as linux/amd64.
   build "$tag" "$ver" basic linux amd64 ""
@@ -210,6 +227,14 @@ for entry in "${VERSIONS[@]}"; do
   case "$tag" in
     go110) build "$tag" "$ver" basic linux amd64 "_stripped" -ldflags "-s -w" ;;  # stripped legacy
     go116) build "$tag" "$ver" basic linux amd64 "_stripped" -ldflags "-s -w" ;;
+    # 32-bit itabs bracket Go 1.23's move to `abi.ITab`: go121 has the
+    # explicit `_ [4]byte` after `hash` (fun at 16), go123 does not (fun at
+    # 12). On 64-bit both put fun at 24, so only a 32-bit fixture pins it.
+    # The first coverage-redesign release: its metadata blobs pin the
+    # format's oldest shape.
+    go120) build "$tag" "$ver" basic linux amd64 "_cover" -cover ;;
+    go121) build "$tag" "$ver" basic linux 386 "" ;;
+    go123) build "$tag" "$ver" basic linux 386 "" ;;
     go124) build "$tag" "$ver" embed linux amd64 ""
            build "$tag" "$ver" basic linux amd64 "_fips" GOFIPS140=v1.0.0 ;;
     go126) build "$tag" "$ver" basic   darwin  arm64 "_stripped" -ldflags "-s -w"
@@ -242,8 +267,117 @@ for entry in "${VERSIONS[@]}"; do
            # reconstructed linear-memory image, so any attempt to narrow that
            # search with file-offset section ranges silently finds nothing.
            build "$tag" "$ver" embed   wasip1  wasm  "" ;;
+    go128) build "$tag" "$ver" basic   linux   amd64 "_stripped" -ldflags "-s -w"
+           # The second slice of the universal fixture (see make_universal).
+           build "$tag" "$ver" basic   darwin  amd64 ""
+           # js/wasm and wasip1/wasm both moved their PCs to 1<<63; js is the
+           # original wasm port and the only fixture of it.
+           build "$tag" "$ver" basic   js      wasm  ""
+           build "$tag" "$ver" embed   wasip1  wasm  ""
+           # A 4-byte-pointer target on a current toolchain.
+           build "$tag" "$ver" basic   linux   386   ""
+           # CGO_ENABLED=bindings records a third cgo mode; it needs no C
+           # compiler (GOEXPERIMENT=cgobindings while it is experimental).
+           build "$tag" "$ver" basic   linux   amd64 "_cgobindings" \
+             CGO_ENABLED=bindings GOEXPERIMENT=cgobindings ;;
   esac
 done
+
+# A universal ("fat") Mach-O file, as `lipo -create` builds one from thin
+# images: a big-endian header (magic 0xcafebabe, slice count, and per slice
+# CPU type and subtype, offset, size and alignment), then each image at an
+# offset aligned to 2^align (2^14 for arm64, 2^12 for the others). lipo needs a
+# darwin host, so the header is written here.
+make_universal() {  # make_universal <dst> <thin...>
+  local dst=$1; shift
+  if [[ $list_only -eq 1 ]]; then echo "  $dst"; return 0; fi
+  local src; for src in "$@"; do
+    if [[ ! -s "$OUT/$src" ]]; then echo "  !! $dst: missing $src"; fail+=("$dst"); return 0; fi
+  done
+  echo "  $dst"
+  if ( cd "$OUT" && python3 - "$dst" "$@" <<'PYEOF'
+import struct, sys
+dst, srcs = sys.argv[1], sys.argv[2:]
+images = [open(s, "rb").read() for s in srcs]
+entries, offset = [], 8 + 20 * len(images)
+for image in images:
+    cputype, subtype = struct.unpack_from("<iI", image, 4)
+    align = 14 if cputype == 0x0100000C else 12
+    offset = (offset + (1 << align) - 1) & ~((1 << align) - 1)
+    entries.append((cputype, subtype, offset, len(image), align))
+    offset += len(image)
+out = bytearray(struct.pack(">II", 0xCAFEBABE, len(images)))
+for e in entries:
+    out += struct.pack(">iIIII", *e)
+for (_, _, off, _, _), image in zip(entries, images):
+    out += b"\0" * (off - len(out))
+    out += image
+open(dst, "wb").write(out)
+PYEOF
+  ); then ok=$((ok + 1)); else echo "    !! failed"; fail+=("$dst"); fi
+}
+if selected go128; then
+  make_universal basic_go128_darwin_universal basic_go128_darwin_amd64 basic_go128_darwin_arm64
+fi
+
+# A module-mode build without -trimpath, to record where a build ran: GOROOT,
+# the module cache, GOPATH and the user's home. The dependency (src/greet) is
+# served from a local file proxy, so no network is needed. The compiler's
+# `-trimpath=old=>new` rewrite places the work tree at /home/gobin and GOROOT
+# at /usr/local/go, the paths a build in that home records, so the fixture
+# does not carry this host's paths. GOEXPERIMENT adds an ` X:` suffix to the
+# version string: one experiment on, one default turned off.
+build_deps() {  # build_deps <tag> <ver> [<variant> [go build args...]]
+  local tag=$1 ver=$2 variant=${3:-} name="deps_${1}_linux_amd64${3:-}"
+  shift 2; [[ $# -gt 0 ]] && shift
+  if [[ $list_only -eq 1 ]]; then echo "  $name"; return 0; fi
+  local goroot; goroot="$(fetch_toolchain "$ver")"
+  if [[ -z "$goroot" ]]; then echo "  !! $name: no go$ver toolchain"; fail+=("$name"); return 0; fi
+  # The build info records the -gcflags setting verbatim, rewrite included,
+  # so GOROOT is reached through a link in the cache: the fixture then names
+  # only cache paths, never where this host keeps its toolchains.
+  local link="$CACHE/deps-goroot"; ln -sfn "$goroot" "$link"; goroot="$link"
+  local root="$WORK/deps-root" home="$WORK/deps-root/home/gobin" proxy="$WORK/deps-proxy"
+  # Go writes the module cache read-only; make it removable first.
+  [[ -d "$root" ]] && chmod -R u+w "$root"
+  rm -rf "$root" "$proxy"; mkdir -p "$home/src/deps" "$home/go" "$proxy"
+  cp -r "$SRC/deps/." "$home/src/deps/"
+  python3 - "$SRC/greet" "$proxy" <<'PYEOF'
+import os, sys, zipfile
+src, proxy = sys.argv[1], sys.argv[2]
+mod, ver = "example.com/greet", "v1.0.0"
+d = os.path.join(proxy, mod, "@v")
+os.makedirs(d)
+open(os.path.join(d, "list"), "w").write(ver + "\n")
+open(os.path.join(d, ver + ".info"), "w").write('{"Version":"%s","Time":"2026-01-01T00:00:00Z"}' % ver)
+open(os.path.join(d, ver + ".mod"), "wb").write(open(os.path.join(src, "go.mod"), "rb").read())
+with zipfile.ZipFile(os.path.join(d, ver + ".zip"), "w") as z:
+    for f in sorted(os.listdir(src)):
+        z.write(os.path.join(src, f), "%s@%s/%s" % (mod, ver, f))
+PYEOF
+  local rewrite="$root/home=>/home;$goroot=>/usr/local/go"
+  echo "  $name"
+  if ( cd "$home/src/deps" && env \
+        HOME="$home" GOPATH="$home/go" GOMODCACHE="$home/go/pkg/mod" \
+        GOROOT="$goroot" GOCACHE="$CACHE/gocache" GOPROXY="file://$proxy" \
+        GOSUMDB=off GOFLAGS=-mod=mod GO111MODULE=on GOTOOLCHAIN=local \
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOEXPERIMENT=arenas,nogreenteagc \
+        "$goroot/bin/go" build "-gcflags=all=-trimpath=$rewrite" \
+          "-asmflags=all=-trimpath=$rewrite" "$@" -o "$OUT/$name" . ) \
+      && [[ -s "$OUT/$name" ]]; then
+    ok=$((ok + 1))
+  else
+    echo "    !! build failed"; rm -f "$OUT/$name"; fail+=("$name")
+  fi
+}
+if selected go128 && fetch_toolchain tip >/dev/null 2>&1; then
+  build_deps go128 tip
+  # Coverage over the module's two packages (the main package and the
+  # dependency), and a stripped twin: the same layout with no symbol table,
+  # which leaves the metadata blobs reachable only from the code.
+  build_deps go128 tip "_cover" -cover -coverpkg=example.com/...
+  build_deps go128 tip "_cover_stripped" -cover -coverpkg=example.com/... -ldflags "-s -w"
+fi
 
 # ---------------------------------------------------------------------------
 # Derived fixtures: produced by post-processing a built binary rather than by
@@ -282,6 +416,11 @@ PYEOF
 
 if [[ ${#SELECT[@]} -eq 0 ]] || selected go124; then
   scrub_version basic_go124_windows_amd64.exe basic_go124_windows_amd64_noversion.exe go1.24
+fi
+# With no version, a 32-bit itab's layout comes from its first record: the
+# word after `hash` is Go 1.10-1.22's zero padding or Go 1.23's `fun[0]`.
+if [[ ${#SELECT[@]} -eq 0 ]] || selected go121; then
+  scrub_version basic_go121_linux_386 basic_go121_linux_386_noversion go1.21
 fi
 
 if [[ $list_only -eq 1 ]]; then exit 0; fi

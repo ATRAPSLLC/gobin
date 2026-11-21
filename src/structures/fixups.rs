@@ -16,7 +16,7 @@
 //!
 //! Source: Apple `dyld` `mach-o/fixup-chains.h`.
 
-use crate::structures::util::{read_u16, read_u32, read_uintptr};
+use crate::util::{read_u16, read_u32, read_uintptr};
 
 /// `DYLD_CHAINED_PTR_64` - 8-byte slots, `target` is an unslid vmaddr.
 const PTR_64: u16 = 2;

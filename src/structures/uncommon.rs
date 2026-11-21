@@ -15,7 +15,7 @@
 //!
 //! Source: `src/internal/abi/type.go:230-236`
 
-use crate::structures::util::{read_i32, read_u16, read_u32};
+use crate::util::{read_i32, read_u16, read_u32};
 
 /// Parsed `abi.UncommonType` -- method metadata appended to types with methods.
 #[derive(Debug, Clone, Copy, Default)]

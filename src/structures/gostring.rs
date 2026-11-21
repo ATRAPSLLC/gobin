@@ -7,7 +7,7 @@
 //!
 //! Source: `src/runtime/string.go`, `src/reflect/value.go:2573-2576`
 
-use crate::structures::util::read_uintptr;
+use crate::util::read_uintptr;
 
 /// A Go string header: `(ptr, len)`, each pointer-sized.
 ///

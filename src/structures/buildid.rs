@@ -43,9 +43,9 @@
 use std::ops::Range;
 
 use crate::{
-    detection::find_bytes,
     formats::BinaryContext,
-    structures::util::{align_up, slice_at},
+    util::find_bytes,
+    util::{align_up, slice_at},
 };
 
 /// Raw build ID prefix in non-ELF binaries.

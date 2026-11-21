@@ -10,7 +10,7 @@
 //!
 //! Source: `src/internal/abi/type.go:422-430` (PtrType), `src/internal/abi/type.go:432-435` (SliceType)
 
-use crate::structures::util::read_uintptr;
+use crate::util::read_uintptr;
 
 /// Parsed extra field for pointer (`*T`) and slice (`[]T`) type descriptors.
 ///

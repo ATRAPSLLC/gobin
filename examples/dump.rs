@@ -14,9 +14,10 @@ use std::collections::BTreeMap;
 use gobin::{
     GoBinary,
     detection::{ConfidenceReport, ConfidenceSignal, ParseError},
-    metadata::FunctionInfo,
+    metadata::{CgoMode, FunctionInfo},
     structures::{
         Arch,
+        pclntab::FuncId,
         types::{GoType, TypeDetail},
     },
 };
@@ -57,17 +58,31 @@ fn main() {
         }
     };
 
-    let bin = match GoBinary::try_parse(&data) {
+    dump(&data, &path, explain);
+}
+
+/// Dump one image; a universal Mach-O file is dumped slice by slice.
+fn dump(data: &[u8], path: &str, explain: bool) {
+    let bin = match GoBinary::try_parse(data) {
         Ok(b) => b,
         Err(ParseError::NotAGoBinary { report }) => {
             eprintln!("{path}: not a Go binary");
-            print_report(&report);
+            print_report(&report, None);
             std::process::exit(1);
+        }
+        Err(ParseError::Universal { slices }) => {
+            for slice in slices {
+                let label = format!("{path} [{:?}]", slice.arch);
+                if let Some(image) = data.get(slice.range.clone()) {
+                    dump(image, &label, explain);
+                }
+            }
+            return;
         }
     };
 
     if explain {
-        print_report(bin.report());
+        print_report(bin.report(), bin.go_version());
         println!();
     }
 
@@ -78,7 +93,7 @@ fn main() {
         .unwrap_or_default();
     let types: Vec<_> = bin.types().collect();
 
-    print_header(&bin, &funcs, &files, &path, data.len());
+    print_header(&bin, &funcs, &files, path, data.len());
     print_build_info(&bin);
     print_extras(&bin);
     print_functions_and_packages(&funcs, &types);
@@ -190,7 +205,7 @@ fn print_extras(bin: &GoBinary<'_>) {
     }
 }
 
-fn print_report(report: &ConfidenceReport) {
+fn print_report(report: &ConfidenceReport, go_version: Option<&str>) {
     eprintln!("[Detection report] tier = {:?}", report.tier);
     if report.signals.is_empty() {
         eprintln!("  (no signals collected)");
@@ -219,12 +234,28 @@ fn print_report(report: &ConfidenceReport) {
             ConfidenceSignal::PclntabMissing { reason } => {
                 eprintln!("  [-] pclntab missing: {reason}")
             }
-            ConfidenceSignal::GoVersionString { version, source } => {
+            ConfidenceSignal::GoVersionString { source } => {
+                let version = go_version.unwrap_or("?");
                 eprintln!("  [+] go version: {version} (source: {source:?})")
             }
             ConfidenceSignal::HeuristicStringsMatched { hits } => {
                 eprintln!("  [+] heuristic strings matched: {hits}")
             }
+            ConfidenceSignal::ModuledataLocated { version, source } => {
+                eprintln!("  [+] moduledata {version:?} found by {source:?}")
+            }
+            ConfidenceSignal::ModuledataMissing => eprintln!("  [-] moduledata missing"),
+            ConfidenceSignal::LayoutsChosen {
+                itab,
+                map,
+                text_offsets_indexed,
+                decided_by,
+            } => eprintln!(
+                "  [+] layouts: itab {itab:?}, map {map:?}, indexed text offsets \
+                 {text_offsets_indexed} (from {decided_by:?})"
+            ),
+            ConfidenceSignal::SymbolTable => eprintln!("  [+] symbol table present"),
+            ConfidenceSignal::SymbolTableStripped => eprintln!("  [-] symbol table stripped"),
         }
     }
 }
@@ -260,6 +291,22 @@ fn print_header(
         );
     }
     println!("  Build ID     : {}", bin.build_id().unwrap_or("none"));
+    let experiments = bin.go_experiments();
+    if !experiments.is_empty() {
+        println!("  Experiments  : {}", experiments.join(","));
+    }
+    let paths = bin.build_paths();
+    for (label, path) in [
+        ("GOROOT", paths.goroot),
+        ("GOPATH", paths.gopath),
+        ("Module cache", paths.module_cache),
+        ("Main dir", paths.main_dir),
+        ("Home", paths.home),
+    ] {
+        if let Some(path) = path {
+            println!("  {label:<13}: {path}");
+        }
+    }
     println!();
 
     println!("[Target]");
@@ -271,11 +318,14 @@ fn print_header(
     if let Some(info) = bin.build_info() {
         println!("  GOOS         : {}", info.goos().unwrap_or("unknown"));
         println!("  GOARCH       : {}", info.goarch().unwrap_or("unknown"));
-        if let Some(cgo) = info.cgo_enabled() {
-            println!(
-                "  CGO          : {}",
-                if cgo { "enabled" } else { "disabled" }
-            );
+        if let Some(cgo) = info.cgo_mode() {
+            let mode = match cgo {
+                CgoMode::Disabled => "disabled".into(),
+                CgoMode::Enabled => "enabled".into(),
+                CgoMode::Bindings => "bindings".into(),
+                CgoMode::Other(value) => format!("CGO_ENABLED={value}"),
+            };
+            println!("  CGO          : {mode}");
         }
     }
     println!();
@@ -283,6 +333,9 @@ fn print_header(
     println!("[Counts]");
     println!("  Functions    : {}", funcs.len());
     println!("  Source files : {}", files.len());
+    println!("  Symbols      : {}", bin.symbols().len());
+    println!("  Runtime hooks: {}", bin.runtime_hooks().len());
+    println!("  Links cgo    : {}", bin.has_cgo());
     println!();
 }
 
@@ -524,41 +577,42 @@ fn print_functions_and_packages(funcs: &[FunctionInfo<'_>], types: &[GoType]) {
 
             for f in sorted {
                 let mut tags = Vec::new();
-                if f.start_line > 0 {
-                    if f.end_line > f.start_line {
-                        tags.push(format!("lines:{}-{}", f.start_line, f.end_line));
+                if f.func.start_line > 0 {
+                    if f.end_line > f.func.start_line {
+                        tags.push(format!("lines:{}-{}", f.func.start_line, f.end_line));
                     } else {
-                        tags.push(format!("line:{}", f.start_line));
+                        tags.push(format!("line:{}", f.func.start_line));
                     }
                 }
-                tags.push(format!("addr:0x{:x}", f.entry_offset));
-                if f.args_size > 0 {
-                    tags.push(format!("args:{}B", f.args_size));
+                tags.push(format!("off:0x{:x}", f.func.entry_off));
+                if f.func.args > 0 {
+                    tags.push(format!("args:{}B", f.func.args));
                 }
                 if f.frame_size > 0 {
                     tags.push(format!("frame:{}B", f.frame_size));
                 }
                 if f.uses_defer() {
-                    tags.push(format!("defer:0x{:x}", f.deferreturn));
+                    tags.push(format!("defer:0x{:x}", f.func.deferreturn));
                 }
-                if f.nfuncdata > 0 {
-                    tags.push(format!("funcdata:{}", f.nfuncdata));
+                if f.func.nfuncdata > 0 {
+                    tags.push(format!("funcdata:{}", f.func.nfuncdata));
                 }
-                if f.npcdata > 0 {
-                    tags.push(format!("pcdata:{}", f.npcdata));
+                if f.func.npcdata > 0 {
+                    tags.push(format!("pcdata:{}", f.func.npcdata));
                 }
-                if let Some(id_name) = f.func_id_name() {
-                    tags.push(format!("funcID:{id_name}"));
+                let func_id = f.func_id;
+                if func_id != FuncId::Normal {
+                    tags.push(format!("funcID:{func_id}"));
                 }
-                if f.flags != 0 {
+                if f.func.flag != 0 {
                     let mut flag_parts = Vec::new();
-                    if f.flags & 0x01 != 0 {
+                    if f.func.flag & 0x01 != 0 {
                         flag_parts.push("TopFrame");
                     }
-                    if f.flags & 0x02 != 0 {
+                    if f.func.flag & 0x02 != 0 {
                         flag_parts.push("SPWrite");
                     }
-                    if f.flags & 0x04 != 0 {
+                    if f.func.flag & 0x04 != 0 {
                         flag_parts.push("Asm");
                     }
                     if !flag_parts.is_empty() {

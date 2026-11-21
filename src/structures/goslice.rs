@@ -5,7 +5,7 @@
 //!
 //! Source: `src/runtime/slice.go`, `src/reflect/value.go:2580-2584`
 
-use crate::structures::util::read_uintptr;
+use crate::util::read_uintptr;
 
 /// A Go slice header: `(ptr, len, cap)`, each pointer-sized.
 #[derive(Debug, Clone, Copy, Default)]

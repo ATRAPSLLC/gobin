@@ -38,7 +38,8 @@
 
 use crate::{
     formats::{BinaryContext, BinaryFormat},
-    structures::{moduledata::Moduledata, util::read_uintptr},
+    structures::moduledata::Moduledata,
+    util::read_uintptr,
 };
 
 /// Minimum length we treat as a plausible string. Below this, the noise
@@ -104,6 +105,11 @@ pub struct GoStringIter<'a> {
     /// data never lives in code).
     text_start: u64,
     text_end: u64,
+    /// The lowest address string bytes can start at: on wasm, the first
+    /// address a data segment initializes (below it linear memory is
+    /// zero-fill, and Go code is not in it, so the text bounds above exclude
+    /// nothing there); `0` elsewhere.
+    data_floor: u64,
     /// The view ranges a header may sit in, in order: the program's data. A
     /// Go string header is a value the program holds, so it lies in the data
     /// the linker places after the code, never in the container's own tables
@@ -120,6 +126,7 @@ impl<'a> GoStringIter<'a> {
             ps: 0,
             text_start: 0,
             text_end: 0,
+            data_floor: 0,
             regions: Vec::new(),
         }
     }
@@ -171,8 +178,8 @@ impl<'a> Iterator for GoStringIter<'a> {
                 Some(v) if v != 0 => v,
                 _ => continue,
             };
-            // Skip pointers into the text segment.
-            if va >= self.text_start && va < self.text_end {
+            // Skip pointers into the text segment, and below the data.
+            if (va >= self.text_start && va < self.text_end) || va < self.data_floor {
                 continue;
             }
             let len_u64 = match read_uintptr(data, header_pos.checked_add(ps)?, ps_u8) {
@@ -246,6 +253,7 @@ pub fn extract_iter<'a>(
         ps,
         text_start,
         text_end,
+        data_floor: ctx.wasm_initialized_start().unwrap_or(0),
         regions,
     }
 }

@@ -117,8 +117,8 @@ use crate::{
     structures::{
         Arch, PclntabVersion,
         bounds::{BoundWord, TextBound},
-        util::{advance, advance_n, read_uintptr, read_uvarint, slice_at},
     },
+    util::{advance, advance_n, read_uintptr, read_uvarint, slice_at},
 };
 
 /// All recognized pclntab magic values, in order from newest to oldest.
@@ -191,6 +191,99 @@ pub struct ParsedPclntab<'a> {
     /// address `0`, so callers do not silently rebase every function entry
     /// against the bottom of the address space. Mirrors `moduledata.text`.
     pub header_text_start: Option<u64>,
+    /// What the Go 1.2-1.15 `_func` record holds in its version-dependent
+    /// slots, read from the function table itself; `None` for the Go 1.16+
+    /// layouts, which have none.
+    pub legacy_func: Option<LegacyFuncLayout>,
+    /// The raw `_func.funcID` the compiler gave wrappers in this binary (see
+    /// [`FuncId`]): the highest ID in the function table, which every Go
+    /// release since 1.12 ends its list with. `None` before Go 1.12, which
+    /// had no wrapper ID, and when no function carries one.
+    pub wrapper_func_id: Option<u8>,
+    /// Which `pcdata[]` table holds a function's inline-tree index
+    /// (`PCDATA_InlTreeIndex`), which tells inlined code from the function's
+    /// own: `1` in Go 1.9-1.12, `2` from Go 1.13. It depends on the Go
+    /// version, which the table does not record, so [`parse`] leaves it
+    /// `None` and [`crate::GoBinary`] sets it when the binary's version
+    /// fixes it. `None` also before Go 1.9, which recorded no inlining.
+    pub inline_index_pcdata: Option<u32>,
+}
+
+/// The value the Go 1.5-1.9 linker writes where the frame size used to be
+/// (`cmd/link/internal/ld/pcln.go`: `frame int32`, "legacy frame size").
+pub const LEGACY_FRAME_PLACEHOLDER: u32 = 0x0123_4567;
+
+/// What a Go 1.2-1.15 `_func` record holds in the word after `args` and at
+/// its tail, which changed twice while the pclntab magic did not.
+///
+/// The word after `args` was the frame size, a placeholder from Go 1.5
+/// ([`LEGACY_FRAME_PLACEHOLDER`]), the funcID in Go 1.10-1.11, and
+/// `deferreturn` from Go 1.12,
+/// which moved the funcID to a byte at the tail before `nfuncdata` (from
+/// `int32` to `uint8`). Measured on the corpus and read from each version's
+/// `runtime._func` and linker (`cmd/link/internal/ld/pcln.go`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyFuncLayout {
+    /// Go 1.2-1.4: the word after `args` is the frame size; no funcID, no
+    /// `deferreturn`.
+    FrameSize,
+    /// Go 1.5-1.9: the word after `args` is the linker's placeholder
+    /// ([`LEGACY_FRAME_PLACEHOLDER`]); no funcID, no `deferreturn`.
+    FramePlaceholder,
+    /// Go 1.10-1.11: the word after `args` is the funcID; no `deferreturn`.
+    FuncIdWord,
+    /// Go 1.12-1.15: the word after `args` is `deferreturn`; the funcID and
+    /// `nfuncdata` are the first and last bytes of the record's last word.
+    DeferReturn,
+}
+
+impl LegacyFuncLayout {
+    /// Read the layout off a Go 1.2-1.15 function table.
+    ///
+    /// From Go 1.12 the last byte of each record is `nfuncdata`, nonzero on
+    /// almost every function (a Go function carries GC maps); before, that
+    /// byte is the high byte of an `int32` count and always zero. Before Go
+    /// 1.12, the funcID of Go 1.10-1.11 is nonzero on a few dozen runtime
+    /// functions, while the frame size and the placeholder before it are
+    /// nonzero on nearly all: measured 15 of 1,805 functions on Go 1.10
+    /// against 1,649 of 1,652 on Go 1.2. The Go 1.5-1.9 placeholder is the
+    /// same word on (nearly) every function; a Go 1.2-1.4 frame size is not.
+    fn detect(pclntab: &ParsedPclntab<'_>) -> Self {
+        let p = pclntab.ptr_size as usize;
+        let (mut records, mut tail_set, mut word_set, mut placeholder) =
+            (0usize, 0usize, 0usize, 0usize);
+        for (_, func_off) in pclntab.func_entries() {
+            let Some(record) = pclntab.data.get(func_off as usize..) else {
+                continue;
+            };
+            let (Some(word), Some(&tail)) = (
+                p.checked_add(8).and_then(|o| slice_at::<4>(record, o)),
+                p.checked_add(31).and_then(|o| record.get(o)),
+            ) else {
+                continue;
+            };
+            records = records.saturating_add(1);
+            if tail != 0 {
+                tail_set = tail_set.saturating_add(1);
+            }
+            let word = u32::from_le_bytes(word);
+            if word != 0 {
+                word_set = word_set.saturating_add(1);
+            }
+            if word == LEGACY_FRAME_PLACEHOLDER {
+                placeholder = placeholder.saturating_add(1);
+            }
+        }
+        if tail_set > 0 {
+            Self::DeferReturn
+        } else if word_set.saturating_mul(2) < records {
+            Self::FuncIdWord
+        } else if placeholder.saturating_mul(2) > records {
+            Self::FramePlaceholder
+        } else {
+            Self::FrameSize
+        }
+    }
 }
 
 /// Scalar metadata of a [`ParsedPclntab`] without the borrowed `data`.
@@ -228,6 +321,12 @@ pub struct PclntabMeta {
     pub text_start: u64,
     /// See [`ParsedPclntab::header_text_start`].
     pub header_text_start: Option<u64>,
+    /// See [`ParsedPclntab::legacy_func`].
+    pub legacy_func: Option<LegacyFuncLayout>,
+    /// See [`ParsedPclntab::wrapper_func_id`].
+    pub wrapper_func_id: Option<u8>,
+    /// See [`ParsedPclntab::inline_index_pcdata`].
+    pub inline_index_pcdata: Option<u32>,
 }
 
 impl PclntabMeta {
@@ -262,6 +361,9 @@ impl PclntabMeta {
             functab_offset: self.functab_offset,
             text_start: self.text_start,
             header_text_start: self.header_text_start,
+            legacy_func: self.legacy_func,
+            wrapper_func_id: self.wrapper_func_id,
+            inline_index_pcdata: self.inline_index_pcdata,
         })
     }
 }
@@ -284,6 +386,9 @@ impl<'a> ParsedPclntab<'a> {
             functab_offset: self.functab_offset,
             text_start: self.text_start,
             header_text_start: self.header_text_start,
+            legacy_func: self.legacy_func,
+            wrapper_func_id: self.wrapper_func_id,
+            inline_index_pcdata: self.inline_index_pcdata,
         }
     }
 
@@ -370,6 +475,79 @@ impl<'a> ParsedPclntab<'a> {
         std::str::from_utf8(remaining.get(..end)?).ok()
     }
 
+    /// Find the binary's wrapper funcID: the highest raw ID in the function
+    /// table, carried by every wrapper since Go 1.12 put it last in the list.
+    /// A highest ID held by a single function that is one of the specials is
+    /// that special's, not a wrapper's (a binary with no wrapper at all).
+    fn detect_wrapper_func_id(&self) -> Option<u8> {
+        let lay = func_layout(self.version, self.ptr_size, self.legacy_func);
+        let id_off = lay.func_id?;
+        if self.legacy_func == Some(LegacyFuncLayout::FuncIdWord) {
+            return None;
+        }
+        let base = self.func_struct_base();
+        let (mut max, mut count, mut sole_func) = (0u8, 0usize, 0u32);
+        for (_, func_off) in self.func_entries() {
+            let Some(&raw) = base
+                .checked_add(func_off as usize)
+                .and_then(|off| off.checked_add(id_off))
+                .and_then(|off| self.data.get(off))
+            else {
+                continue;
+            };
+            if raw > max {
+                (max, count, sole_func) = (raw, 1, func_off);
+            } else if raw == max && raw != 0 {
+                count = count.saturating_add(1);
+            }
+        }
+        if max == 0 {
+            return None;
+        }
+        if count == 1 {
+            let name = self
+                .parse_func(sole_func)
+                .and_then(|func| self.func_name(func.name_off as u32))?;
+            if FuncId::special(name).is_some() {
+                return None;
+            }
+        }
+        Some(max)
+    }
+
+    /// Classify the funcID of `func`, the function named `name` (see
+    /// [`FuncId::classify`]).
+    pub fn func_id(&self, func: &FuncData, name: &str) -> FuncId {
+        FuncId::classify(func.func_id, name, self.wrapper_func_id)
+    }
+
+    /// The `(entryoff, funcoff)` pair of the function whose code holds text
+    /// offset `off`: the last function starting at or before it, if `off`
+    /// precedes the end of the code (the functab's end sentinel).
+    ///
+    /// The functab is sorted by entry offset, so this is a binary search over
+    /// it, the lookup the runtime's `findfunc` makes, with no index built.
+    pub fn func_containing(&self, off: u32) -> Option<(u32, u32)> {
+        let entries = self.func_entries();
+        let (end, _) = entries.entry_at(self.nfunc)?;
+        if off >= end {
+            return None;
+        }
+        // The first index whose entry lies past `off`; the function before it
+        // holds `off`.
+        let (mut lo, mut hi) = (0usize, self.nfunc);
+        while lo < hi {
+            let mid = lo.checked_add(hi.checked_sub(lo)? / 2)?;
+            let (entry, _) = entries.entry_at(mid)?;
+            if entry <= off {
+                lo = mid.checked_add(1)?;
+            } else {
+                hi = mid;
+            }
+        }
+        entries.entry_at(lo.checked_sub(1)?)
+    }
+
     /// Iterate over `(entryoff, funcoff)` pairs from the functab.
     ///
     /// Each pair is 8 bytes (two `u32`s). There are `nfunc` entries
@@ -414,7 +592,7 @@ impl<'a> ParsedPclntab<'a> {
     pub fn parse_func(&self, func_off: u32) -> Option<FuncData> {
         let off = self.func_struct_base().checked_add(func_off as usize)?;
         let d = self.data.get(off..)?;
-        let lay = func_layout(self.version, self.ptr_size);
+        let lay = func_layout(self.version, self.ptr_size, self.legacy_func);
         if d.len() < lay.size {
             return None;
         }
@@ -451,7 +629,10 @@ impl<'a> ParsedPclntab<'a> {
             entry_off,
             name_off: i32::from_le_bytes(slice_at::<4>(d, lay.name_off)?),
             args: i32::from_le_bytes(slice_at::<4>(d, lay.args)?),
-            deferreturn: u32::from_le_bytes(slice_at::<4>(d, lay.deferreturn)?),
+            deferreturn: match lay.deferreturn {
+                Some(o) => u32::from_le_bytes(slice_at::<4>(d, o)?),
+                None => 0,
+            },
             pcsp: u32::from_le_bytes(slice_at::<4>(d, lay.pcsp)?),
             pcfile: u32::from_le_bytes(slice_at::<4>(d, lay.pcfile)?),
             pcln: u32::from_le_bytes(slice_at::<4>(d, lay.pcln)?),
@@ -475,7 +656,7 @@ impl<'a> ParsedPclntab<'a> {
         let base = self
             .func_struct_base()
             .checked_add(func.func_off as usize)?
-            .checked_add(func_layout(self.version, self.ptr_size).size)?;
+            .checked_add(func_layout(self.version, self.ptr_size, self.legacy_func).size)?;
         let pos = base.checked_add((i as usize).checked_mul(4)?)?;
         Some(u32::from_le_bytes(slice_at::<4>(self.data, pos)?))
     }
@@ -493,11 +674,24 @@ impl<'a> ParsedPclntab<'a> {
         let base = self
             .func_struct_base()
             .checked_add(func.func_off as usize)?
-            .checked_add(func_layout(self.version, self.ptr_size).size)?;
+            .checked_add(func_layout(self.version, self.ptr_size, self.legacy_func).size)?;
         let pcdata_bytes = (func.npcdata as usize).checked_mul(4)?;
         let after_pcdata = base.checked_add(pcdata_bytes)?;
         let pos = after_pcdata.checked_add((i as usize).checked_mul(4)?)?;
         Some(u32::from_le_bytes(slice_at::<4>(self.data, pos)?))
+    }
+
+    /// Where the `funcdata[]` slots of `func` begin, as an offset into
+    /// [`Self::data`]: right after its `pcdata[]` table offsets. Go 1.18+
+    /// slots are `u32` offsets ([`Self::funcdata_at`]); through Go 1.17 they
+    /// are pointers, which the runtime aligns to 8 bytes on 64-bit targets
+    /// (`runtime.funcdata`), an alignment of the slot's address the caller
+    /// applies.
+    pub fn funcdata_slots(&self, func: &FuncData) -> Option<usize> {
+        self.func_struct_base()
+            .checked_add(func.func_off as usize)?
+            .checked_add(func_layout(self.version, self.ptr_size, self.legacy_func).size)?
+            .checked_add((func.npcdata as usize).checked_mul(4)?)
     }
 
     /// Decode a PC-value table from the pctab.
@@ -506,10 +700,13 @@ impl<'a> ParsedPclntab<'a> {
     /// Each entry is a `(value_delta, pc_delta)` pair in unsigned varint encoding:
     /// - `value_delta` uses zigzag encoding (bit 0 = sign, remaining bits = magnitude)
     /// - `pc_delta` is unsigned, multiplied by `minLC` to get the real PC advance
-    /// - A `pc_delta` of 0 terminates the table
+    /// - A zero `value_delta` after the first pair terminates the table
+    ///   (`runtime.step`); a zero `pc_delta`, which the encoder never writes,
+    ///   is read as the end too
     ///
-    /// Returns `(pc_offset, value)` pairs where `pc_offset` is relative to
-    /// the function entry and `value` is the accumulated decoded value.
+    /// Yields `(pc_end, value)` steps: `value` holds for the PCs (offsets from
+    /// the function's entry) from the previous step's `pc_end`, `0` for the
+    /// first, up to but not including `pc_end`.
     ///
     /// Source: `src/runtime/symtab.go:518-571` (`pcvalue`),
     /// `src/cmd/internal/obj/pcln.go:112-137` (encoder)
@@ -522,22 +719,22 @@ impl<'a> ParsedPclntab<'a> {
             pc: 0,
             val: -1,
             min_lc: self.min_lc as u32,
+            first: true,
             done: data.is_empty(),
         }
     }
 
-    /// Streaming PC-to-line iterator. Line numbers are absolute
-    /// (`start_line + accumulated delta`).
-    pub fn decode_pcln(&self, func: &FuncData) -> PcLineIter<'a> {
-        PcLineIter {
-            inner: self.decode_pcvalue(func.pcln),
-            start_line: func.start_line,
-        }
+    /// Streaming PC-to-line iterator: `(pc_end, line)` steps as
+    /// [`Self::decode_pcvalue`] yields them. The table holds absolute line
+    /// numbers in every Go version (`cmd/internal/obj/pcln.go`, `pctoline`);
+    /// the Go 1.20+ `start_line` is the line of the `func` keyword, apart.
+    pub fn decode_pcln(&self, func: &FuncData) -> PcValueIter<'a> {
+        self.decode_pcvalue(func.pcln)
     }
 
-    /// Streaming PC-to-file iterator yielding `(pc_offset, file_index)`.
-    /// `file_index` is unsigned and suitable for passing to
-    /// [`Self::resolve_file_via_cu`] together with `func.cu_offset`.
+    /// Streaming PC-to-file iterator yielding `(pc_end, file_index)` steps as
+    /// [`Self::decode_pcvalue`] yields them. `file_index` resolves through
+    /// [`Self::resolve_file_index`] together with `func.cu_offset`.
     pub fn decode_pcfile(&self, func: &FuncData) -> PcFileIter<'a> {
         PcFileIter {
             inner: self.decode_pcvalue(func.pcfile),
@@ -554,38 +751,59 @@ impl<'a> ParsedPclntab<'a> {
         }
     }
 
-    /// Joined PC-to-line-and-file iterator yielding
-    /// `(pc_offset, line, file_path)`.
+    /// Joined PC-to-line-and-file iterator yielding `(pc_end, line,
+    /// file_path)`: the line and file in effect for the PCs from the previous
+    /// item's `pc_end` (`0` for the first) up to `pc_end`.
     ///
-    /// The pclntab encodes line numbers and file numbers as two independent
-    /// run-length tables: pcfile only emits a transition when the *file*
-    /// changes, while pcln emits one per line transition. To attribute a
-    /// source file to each line event, callers otherwise have to pre-collect
-    /// pcfile and run their own "latest pcfile entry ≤ pc" lookup. This
-    /// helper folds that bookkeeping in.
+    /// The pclntab encodes lines and files as two independent step tables,
+    /// so an item ends wherever either steps: consecutive items may repeat a
+    /// line (where only the file changes, as when inlined code from another
+    /// file sits on the same line number) or a file.
     ///
-    /// pcfile entries whose index doesn't resolve through the cutab are
-    /// skipped (consistent with [`Self::decode_pcfile_paths`]). pcln events
-    /// before the first pcfile transition are also skipped - they would
-    /// have no file to attribute to.
+    /// Ranges whose file index doesn't resolve are skipped (consistent with
+    /// [`Self::decode_pcfile_paths`]).
     pub fn decode_pcln_with_files<'pcl>(&'pcl self, func: &FuncData) -> PcLineFileIter<'pcl, 'a> {
+        let mut lines = self.decode_pcln(func);
+        let mut files = self.decode_pcfile(func);
         PcLineFileIter {
-            inner: self.decode_pcln(func),
-            pcfile: self.decode_pcfile(func).collect(),
-            cursor: None,
+            line: lines.next(),
+            file: files.next(),
+            lines,
+            files,
+            pc: 0,
             pcl: self,
             cu_offset: func.cu_offset,
         }
     }
 
-    /// Resolve the source file for a function via its pcfile and cutab entries.
-    ///
-    /// Returns the file name for the first (entry-point) file index. Wraps
-    /// [`Self::decode_pcfile`] + [`Self::resolve_file_via_cu`] for the common
-    /// "where does this function start in source?" use case.
+    /// `func`'s inline-tree index table (`PCDATA_InlTreeIndex`, see
+    /// [`Self::inline_index_pcdata`]): `(pc_end, index)` steps, an index of
+    /// `0` or more marking code inlined into `func`. Empty when nothing was
+    /// inlined into it; `None` when the binary's Go version leaves the
+    /// table's slot unknown.
+    pub fn inline_index_table(&self, func: &FuncData) -> Option<PcValueIter<'a>> {
+        let slot = self.inline_index_pcdata?;
+        Some(match self.pcdata_at(func, slot) {
+            Some(table) if table != 0 => self.decode_pcvalue(table),
+            _ => PcValueIter::empty(),
+        })
+    }
+
+    /// The source `func`'s own code spans, leaving out code inlined into it:
+    /// see [`OwnCode`].
+    pub fn own_code(&self, func: &FuncData) -> OwnCode {
+        OwnCode::walk(
+            self.decode_pcln(func),
+            self.decode_pcfile(func),
+            self.inline_index_table(func),
+        )
+    }
+
+    /// The source file of the function's own code ([`Self::own_code`]): the
+    /// file of its first PC that is not code inlined into it.
     pub fn resolve_source_file(&self, func: &FuncData) -> Option<&'a str> {
-        let (_, idx) = self.decode_pcfile(func).next()?;
-        self.resolve_file_index(func.cu_offset, idx)
+        let index = self.own_code(func).file_index?;
+        self.resolve_file_index(func.cu_offset, index)
     }
 
     /// Resolve a `pcfile` file index to its source path, dispatching on the
@@ -640,22 +858,10 @@ impl<'a> ParsedPclntab<'a> {
         std::str::from_utf8(remaining.get(..end)?).ok()
     }
 
-    /// Get the line number range for a function: `(start_line, end_line)`.
-    ///
-    /// Streams the pcln table once to find the min and max line numbers.
+    /// The lowest and highest source line of the function's own code
+    /// ([`Self::own_code`]), leaving out the lines of code inlined into it.
     pub fn line_range(&self, func: &FuncData) -> Option<(i32, i32)> {
-        let mut iter = self.decode_pcln(func);
-        let (_, first) = iter.next()?;
-        let (mut min, mut max) = (first, first);
-        for (_, line) in iter {
-            if line < min {
-                min = line;
-            }
-            if line > max {
-                max = line;
-            }
-        }
-        Some((min, max))
+        self.own_code(func).lines
     }
 
     /// Get the maximum stack frame size for a function.
@@ -706,6 +912,32 @@ pub struct FuncEntryIter<'a> {
     text_start: u64,
 }
 
+impl FuncEntryIter<'_> {
+    /// The `(entryoff, funcoff)` pair at `index` of the functab. Index
+    /// `count` is the end sentinel, whose entry offset is the end of the code.
+    fn entry_at(&self, index: usize) -> Option<(u32, u32)> {
+        if matches!(self.version, PclntabVersion::Go12 | PclntabVersion::Go116) {
+            let ps = self.ptr_size as usize;
+            let stride = ps.checked_mul(2)?;
+            let off = index
+                .checked_mul(stride)
+                .and_then(|d| self.base.checked_add(d))?;
+            let entry_abs = read_uintptr(self.data, off, self.ptr_size)?;
+            let funcoff = read_uintptr(self.data, off.checked_add(ps)?, self.ptr_size)?;
+            let eo = u32::try_from(entry_abs.saturating_sub(self.text_start)).unwrap_or(u32::MAX);
+            let fo = u32::try_from(funcoff).unwrap_or(u32::MAX);
+            Some((eo, fo))
+        } else {
+            let off = index
+                .checked_mul(8)
+                .and_then(|d| self.base.checked_add(d))?;
+            let eo = u32::from_le_bytes(slice_at::<4>(self.data, off)?);
+            let fo = u32::from_le_bytes(slice_at::<4>(self.data, off.checked_add(4)?)?);
+            Some((eo, fo))
+        }
+    }
+}
+
 impl Iterator for FuncEntryIter<'_> {
     type Item = (u32, u32);
 
@@ -713,31 +945,9 @@ impl Iterator for FuncEntryIter<'_> {
         if self.index >= self.count {
             return None;
         }
-        let (entry_off, func_off) =
-            if matches!(self.version, PclntabVersion::Go12 | PclntabVersion::Go116) {
-                let ps = self.ptr_size as usize;
-                let stride = ps.checked_mul(2)?;
-                let off = self
-                    .index
-                    .checked_mul(stride)
-                    .and_then(|d| self.base.checked_add(d))?;
-                let entry_abs = read_uintptr(self.data, off, self.ptr_size)?;
-                let funcoff = read_uintptr(self.data, off.checked_add(ps)?, self.ptr_size)?;
-                let eo =
-                    u32::try_from(entry_abs.saturating_sub(self.text_start)).unwrap_or(u32::MAX);
-                let fo = u32::try_from(funcoff).unwrap_or(u32::MAX);
-                (eo, fo)
-            } else {
-                let off = self
-                    .index
-                    .checked_mul(8)
-                    .and_then(|d| self.base.checked_add(d))?;
-                let eo = u32::from_le_bytes(slice_at::<4>(self.data, off)?);
-                let fo = u32::from_le_bytes(slice_at::<4>(self.data, off.checked_add(4)?)?);
-                (eo, fo)
-            };
+        let entry = self.entry_at(self.index)?;
         self.index = self.index.checked_add(1)?;
-        Some((entry_off, func_off))
+        Some(entry)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -853,7 +1063,25 @@ pub struct PcValueIter<'a> {
     pc: u32,
     val: i32,
     min_lc: u32,
+    /// Whether the next step is the table's first, the only one whose value
+    /// delta may be zero: after it a zero value delta ends the table.
+    first: bool,
     done: bool,
+}
+
+impl PcValueIter<'_> {
+    /// A table with no steps.
+    fn empty() -> Self {
+        Self {
+            data: &[],
+            pos: 0,
+            pc: 0,
+            val: -1,
+            min_lc: 1,
+            first: true,
+            done: true,
+        }
+    }
 }
 
 impl Iterator for PcValueIter<'_> {
@@ -870,6 +1098,14 @@ impl Iterator for PcValueIter<'_> {
                 return None;
             }
         };
+        // A table ends with a zero value delta (`runtime.step`): every later
+        // step changes the value, so a zero there is the terminator, and the
+        // bytes after it belong to the next table.
+        if uvdelta == 0 && !self.first {
+            self.done = true;
+            return None;
+        }
+        self.first = false;
         self.pos = match self.pos.checked_add(n1) {
             Some(p) => p,
             None => {
@@ -914,22 +1150,6 @@ impl Iterator for PcValueIter<'_> {
     }
 }
 
-/// Streaming PC-to-line iterator. Wraps [`PcValueIter`] and adds the
-/// function's `start_line` to each accumulated value.
-pub struct PcLineIter<'a> {
-    inner: PcValueIter<'a>,
-    start_line: i32,
-}
-
-impl Iterator for PcLineIter<'_> {
-    type Item = (u32, i32);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (pc, v) = self.inner.next()?;
-        Some((pc, v.wrapping_add(self.start_line)))
-    }
-}
-
 /// Streaming PC-to-file-index iterator. Re-types the value to `u32` since
 /// file indices are non-negative.
 pub struct PcFileIter<'a> {
@@ -966,23 +1186,17 @@ impl<'a> Iterator for PcFilePathIter<'_, 'a> {
     }
 }
 
-/// Streaming PC-to-line iterator with the active source file pre-joined.
-///
-/// Yields `(pc_offset, line, file_path)`. The file table only emits a
-/// transition when the active source file *changes*, so the joined iterator
-/// carries the latest transition forward across `pcln` events. Entries whose
-/// file index doesn't resolve through the cutab are skipped silently - same
-/// rule as [`PcFilePathIter`].
-///
-/// This replaces the hand-rolled "walk pcfile and pcln in lockstep" state
-/// machine that every consumer otherwise reinvents.
+/// Streaming PC-to-line iterator with the source file joined in: see
+/// [`ParsedPclntab::decode_pcln_with_files`].
 pub struct PcLineFileIter<'pcl, 'a> {
-    inner: PcLineIter<'a>,
-    /// Pre-collected `(pc_offset, file_index)` transitions, in PC order.
-    pcfile: Vec<(u32, u32)>,
-    /// Index into `pcfile` of the most recent transition whose pc ≤ current.
-    /// Starts as `None` until at least one event has been observed.
-    cursor: Option<usize>,
+    lines: PcValueIter<'a>,
+    files: PcFileIter<'a>,
+    /// The line step in effect, `None` once the table ends.
+    line: Option<(u32, i32)>,
+    /// The file step in effect, `None` once the table ends.
+    file: Option<(u32, u32)>,
+    /// Where the next item starts.
+    pc: u32,
     pcl: &'pcl ParsedPclntab<'a>,
     cu_offset: u32,
 }
@@ -992,41 +1206,293 @@ impl<'a> Iterator for PcLineFileIter<'_, 'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (pc, line) = self.inner.next()?;
-
-            // Advance the pcfile cursor to the latest transition with pc ≤ current.
-            // pcfile transitions are emitted in monotonically increasing PC order,
-            // and we walk pcln in the same order - so the cursor only ever moves
-            // forward.
-            let mut next_idx = match self.cursor {
-                Some(c) => c.saturating_add(1),
-                None => 0,
-            };
-            while let Some(&(t_pc, _)) = self.pcfile.get(next_idx) {
-                if t_pc > pc {
-                    break;
-                }
-                self.cursor = Some(next_idx);
-                next_idx = match next_idx.checked_add(1) {
-                    Some(n) => n,
-                    None => break,
-                };
+            let (line_end, line) = self.line?;
+            let (file_end, file) = self.file?;
+            let end = line_end.min(file_end);
+            if end <= self.pc {
+                // A table whose PCs do not increase is malformed.
+                self.line = None;
+                return None;
             }
-
-            let cursor = match self.cursor {
-                Some(c) => c,
-                // No pcfile transition yet ≤ current pc - try the next pcln event.
-                None => continue,
-            };
-            let (_, file_idx) = match self.pcfile.get(cursor) {
-                Some(t) => *t,
-                None => continue,
-            };
-            match self.pcl.resolve_file_index(self.cu_offset, file_idx) {
-                Some(path) => return Some((pc, line, path)),
-                None => continue,
+            self.pc = end;
+            if line_end == end {
+                self.line = self.lines.next();
+            }
+            if file_end == end {
+                self.file = self.files.next();
+            }
+            if let Some(path) = self.pcl.resolve_file_index(self.cu_offset, file) {
+                return Some((end, line, path));
             }
         }
+    }
+}
+
+/// The source a function's own code spans, leaving out the code inlined
+/// into it ([`ParsedPclntab::own_code`]).
+///
+/// Code the compiler inlined into a function keeps its callee's position,
+/// often in another file or far from the function, so a function's own code
+/// is not every PC its line table covers. Its own PCs are those its inline
+/// index table ([`ParsedPclntab::inline_index_table`]) marks with no inlined
+/// call and that lie in its own file, the file of the first of them. The
+/// file check matters because the table does not mark every instruction of
+/// inlined code: in every Go version from 1.9 a few percent of functions
+/// hold unmarked instructions at an inlined callee's position (measured on
+/// the test fixtures, Go 1.9 through 1.28). Where the binary's Go version
+/// leaves the table unknown (before
+/// Go 1.9, which recorded no inlining but kept the callee's position all the
+/// same; or a Go 1.12-1.15 binary with no version string) the file check
+/// alone decides, against the file of the function's entry. A function
+/// whose own code spans files, as a package's generated initializer
+/// (`pkg.init`) runs the variable initializers of all its files, is reduced
+/// to the first file's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnCode {
+    /// The file index ([`ParsedPclntab::resolve_file_index`]) of the
+    /// function's first own PC.
+    pub file_index: Option<u32>,
+    /// The lowest and highest line of its own PCs.
+    pub lines: Option<(i32, i32)>,
+}
+
+impl OwnCode {
+    /// Walk a function's line, file and inline-index tables (`(pc_end,
+    /// value)` steps) in step; `inline` is `None` when the index table is
+    /// unknown.
+    pub fn walk(
+        mut lines: impl Iterator<Item = (u32, i32)>,
+        mut files: impl Iterator<Item = (u32, u32)>,
+        inline: Option<impl Iterator<Item = (u32, i32)>>,
+    ) -> Self {
+        let mut inline = inline.into_iter().flatten();
+        let (mut line, mut file, mut inlined) = (lines.next(), files.next(), inline.next());
+        let mut own = Self::default();
+        let mut pc = 0u32;
+        while let Some((line_end, line_value)) = line {
+            let file_index = file.map(|(_, index)| index);
+            let is_own = inlined.is_none_or(|(_, index)| index < 0)
+                && match own.lines {
+                    // The first own PC fixes the function's own file.
+                    None => true,
+                    Some(_) => file_index == own.file_index,
+                };
+            if is_own {
+                own.file_index = own.file_index.or(file_index);
+                own.lines = Some(match own.lines {
+                    Some((lo, hi)) => (lo.min(line_value), hi.max(line_value)),
+                    None => (line_value, line_value),
+                });
+            }
+            // The next PC where any table steps.
+            let end = [file.map(|(end, _)| end), inlined.map(|(end, _)| end)]
+                .into_iter()
+                .flatten()
+                .fold(line_end, u32::min);
+            if end <= pc {
+                break; // PCs that do not increase: malformed
+            }
+            pc = end;
+            if line_end <= pc {
+                line = lines.next();
+            }
+            if file.is_some_and(|(end, _)| end <= pc) {
+                file = files.next();
+            }
+            if inlined.is_some_and(|(end, _)| end <= pc) {
+                inlined = inline.next();
+            }
+        }
+        own
+    }
+}
+
+/// What the `_func.funcID` byte marks a function as.
+///
+/// The compiler gives a nonzero ID to the runtime functions the traceback
+/// and the garbage collector treat specially (the goroutine entry and exit
+/// points, the stack-switching helpers) and to wrappers. It assigns a special
+/// ID by name (`cmd/internal/objabi`, `GetFuncID`: a `runtime.` function in
+/// its table) unless the function is a wrapper, which gets the wrapper ID
+/// whatever its name: from Go 1.17 an assembly function's ABI wrapper shares
+/// its name (two `runtime.mstart`, one of each ID). The raw numbers are an
+/// `iota` list Go has renumbered as functions joined and left it (Go 1.11,
+/// 1.12, 1.14, 1.16, 1.17, 1.22, 1.25); the wrapper ID, added in Go 1.12, is
+/// the last entry of every list since. [`Self::classify`] therefore needs the
+/// binary's wrapper ID ([`ParsedPclntab::wrapper_func_id`], read off its
+/// function table) and no Go version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FuncId {
+    /// An ordinary function (ID `0`).
+    Normal,
+    /// `runtime.abort` (Go 1.17+).
+    Abort,
+    /// `runtime.asmcgocall`.
+    Asmcgocall,
+    /// `runtime.asyncPreempt` (Go 1.14+).
+    AsyncPreempt,
+    /// `runtime.bgsweep` (Go 1.10 only).
+    Bgsweep,
+    /// `runtime.cgocallback` (`runtime.cgocallback_gofunc` before Go 1.16).
+    Cgocallback,
+    /// `runtime.corostart` (Go 1.22+).
+    Corostart,
+    /// `runtime.debugCallV1` (before Go 1.17).
+    DebugCallV1,
+    /// `runtime.debugCallV2` (Go 1.17+).
+    DebugCallV2,
+    /// `runtime.externalthreadhandler` (Windows, before Go 1.17).
+    ExternalThreadHandler,
+    /// `runtime.forcegchelper` (Go 1.10 only).
+    Forcegchelper,
+    /// `runtime.gcBgMarkWorker`.
+    GcBgMarkWorker,
+    /// `runtime.goexit`, the return address of every goroutine's entry.
+    Goexit,
+    /// `runtime.gogo`.
+    Gogo,
+    /// `runtime.gopanic`.
+    Gopanic,
+    /// `runtime.handleAsyncEvent` (wasm, Go 1.14+).
+    HandleAsyncEvent,
+    /// `runtime.jmpdefer` (before Go 1.18).
+    Jmpdefer,
+    /// `runtime.mcall`.
+    Mcall,
+    /// `runtime.morestack`.
+    Morestack,
+    /// `runtime.mstart`.
+    Mstart,
+    /// `runtime.panicwrap`.
+    Panicwrap,
+    /// `runtime.rt0_go`, the runtime's entry point.
+    Rt0Go,
+    /// `runtime.main`, which runs package initialization and `main.main`.
+    RuntimeMain,
+    /// `runtime.runfinq` (before Go 1.25).
+    Runfinq,
+    /// `runtime.runFinalizers` (Go 1.25+).
+    RunFinalizers,
+    /// `runtime.runCleanups` (Go 1.25+).
+    RunCleanups,
+    /// `runtime.sigpanic`.
+    Sigpanic,
+    /// `runtime.systemstack`.
+    Systemstack,
+    /// `runtime.systemstack_switch`.
+    SystemstackSwitch,
+    /// `runtime.timerproc` (Go 1.10 only).
+    Timerproc,
+    /// Hidden from tracebacks: compiler-generated code (method value,
+    /// interface and ABI wrappers, hash and equality algorithms) and the
+    /// runtime functions the compiler marks alike, such as
+    /// `runtime.deferreturn`.
+    Wrapper,
+    /// A nonzero ID that is neither the wrapper's nor one the function's name
+    /// accounts for: a special function this table does not know (a newer Go
+    /// version), or a corrupt record.
+    Unknown(u8),
+}
+
+impl FuncId {
+    /// Classify the raw `_func.funcID` of the function named `name`, in a
+    /// binary whose wrapper ID is `wrapper`.
+    ///
+    /// `0` is [`Self::Normal`] and `wrapper` is [`Self::Wrapper`]. Any other
+    /// ID is the special the function's `runtime.` name names, and
+    /// [`Self::Unknown`] when the name names none.
+    pub fn classify(raw: u8, name: &str, wrapper: Option<u8>) -> Self {
+        if raw == 0 {
+            return Self::Normal;
+        }
+        if wrapper == Some(raw) {
+            return Self::Wrapper;
+        }
+        Self::special(name).unwrap_or(Self::Unknown(raw))
+    }
+
+    /// The special ID the compiler gives the function named `name`, if any:
+    /// its table across Go 1.10-1.28, keyed by the name after `runtime.`.
+    pub fn special(name: &str) -> Option<Self> {
+        let id = match name.strip_prefix("runtime.")? {
+            "abort" => Self::Abort,
+            "asmcgocall" => Self::Asmcgocall,
+            "asyncPreempt" => Self::AsyncPreempt,
+            "bgsweep" => Self::Bgsweep,
+            "cgocallback" | "cgocallback_gofunc" => Self::Cgocallback,
+            "corostart" => Self::Corostart,
+            "debugCallV1" => Self::DebugCallV1,
+            "debugCallV2" => Self::DebugCallV2,
+            "externalthreadhandler" => Self::ExternalThreadHandler,
+            "forcegchelper" => Self::Forcegchelper,
+            "gcBgMarkWorker" => Self::GcBgMarkWorker,
+            "goexit" => Self::Goexit,
+            "gogo" => Self::Gogo,
+            "gopanic" => Self::Gopanic,
+            "handleAsyncEvent" => Self::HandleAsyncEvent,
+            "jmpdefer" => Self::Jmpdefer,
+            "mcall" => Self::Mcall,
+            "morestack" => Self::Morestack,
+            "mstart" => Self::Mstart,
+            "panicwrap" => Self::Panicwrap,
+            "rt0_go" => Self::Rt0Go,
+            "main" => Self::RuntimeMain,
+            "runfinq" => Self::Runfinq,
+            "runFinalizers" => Self::RunFinalizers,
+            "runCleanups" => Self::RunCleanups,
+            "sigpanic" => Self::Sigpanic,
+            "systemstack" => Self::Systemstack,
+            "systemstack_switch" => Self::SystemstackSwitch,
+            "timerproc" => Self::Timerproc,
+            _ => return None,
+        };
+        Some(id)
+    }
+
+    /// The Go constant's name without its `FuncID_` prefix (`"goexit"`,
+    /// `"runtime_main"`, `"wrapper"`; `"normal"` for [`Self::Normal`] and
+    /// `"unknown"` for [`Self::Unknown`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Abort => "abort",
+            Self::Asmcgocall => "asmcgocall",
+            Self::AsyncPreempt => "asyncPreempt",
+            Self::Bgsweep => "bgsweep",
+            Self::Cgocallback => "cgocallback",
+            Self::Corostart => "corostart",
+            Self::DebugCallV1 => "debugCallV1",
+            Self::DebugCallV2 => "debugCallV2",
+            Self::ExternalThreadHandler => "externalthreadhandler",
+            Self::Forcegchelper => "forcegchelper",
+            Self::GcBgMarkWorker => "gcBgMarkWorker",
+            Self::Goexit => "goexit",
+            Self::Gogo => "gogo",
+            Self::Gopanic => "gopanic",
+            Self::HandleAsyncEvent => "handleAsyncEvent",
+            Self::Jmpdefer => "jmpdefer",
+            Self::Mcall => "mcall",
+            Self::Morestack => "morestack",
+            Self::Mstart => "mstart",
+            Self::Panicwrap => "panicwrap",
+            Self::Rt0Go => "rt0_go",
+            Self::RuntimeMain => "runtime_main",
+            Self::Runfinq => "runfinq",
+            Self::RunFinalizers => "runFinalizers",
+            Self::RunCleanups => "runCleanups",
+            Self::Sigpanic => "sigpanic",
+            Self::Systemstack => "systemstack",
+            Self::SystemstackSwitch => "systemstack_switch",
+            Self::Timerproc => "timerproc",
+            Self::Wrapper => "wrapper",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for FuncId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1039,21 +1505,11 @@ impl<'a> Iterator for PcLineFileIter<'_, 'a> {
 /// - `name_off`: index into `funcnametab` to get the package-qualified function name
 /// - `entry_off`: PC offset from `runtime.text`, used to map addresses back to functions
 /// - `start_line`: source line where the `func` keyword appears
-/// - `func_id`: nonzero for special runtime functions (see FuncID constants below)
-///
-/// ## FuncID Values (from `src/internal/abi/symtab.go:62-96`)
-///
-/// | Value | Name                    | Description                    |
-/// |-------|-------------------------|--------------------------------|
-/// | 0     | `FuncIDNormal`          | Regular user/library function  |
-/// | 80    | `FuncID_abort`          | `runtime.abort`                |
-/// | 86    | `FuncID_goexit`         | Goroutine exit                 |
-/// | 91    | `FuncID_morestack`      | Stack growth                   |
-/// | 92    | `FuncID_mstart`         | Machine/thread start           |
-/// | 94    | `FuncID_rt0_go`         | Runtime entry point            |
-/// | 96    | `FuncID_runtime_main`   | `runtime.main`                 |
-/// | 100   | `FuncIDWrapper`         | Auto-generated wrapper         |
-#[derive(Debug)]
+/// - `func_id`: nonzero for special runtime functions and compiler-generated
+///   wrappers. The raw numbers are renumbered between Go versions; classify
+///   one with [`ParsedPclntab::func_id`] ([`FuncId::classify`]), which reads it
+///   the way the compiler assigns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FuncData {
     /// Offset of this `_func` struct within the functab section. Required to
     /// locate the variable-length `pcdata[]` and `funcdata[]` arrays that
@@ -1645,7 +2101,7 @@ fn parse_header(
         None
     };
 
-    Some(ParsedPclntab {
+    let mut pclntab = ParsedPclntab {
         data,
         offset: base_offset,
         version,
@@ -1660,7 +2116,12 @@ fn parse_header(
         functab_offset,
         text_start,
         header_text_start,
-    })
+        legacy_func: None,
+        wrapper_func_id: None,
+        inline_index_pcdata: None,
+    };
+    pclntab.wrapper_func_id = pclntab.detect_wrapper_func_id();
+    Some(pclntab)
 }
 
 /// Parse the legacy (Go 1.2-1.15) pclntab header.
@@ -1736,7 +2197,7 @@ fn parse_header_go12(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
     // even though the legacy moduledata is parsed separately.
     let text_start = read_uintptr(data, functab_offset, ptr_size)?;
 
-    Some(ParsedPclntab {
+    let mut pclntab = ParsedPclntab {
         data,
         offset: base_offset,
         version: PclntabVersion::Go12,
@@ -1754,7 +2215,13 @@ fn parse_header_go12(data: &[u8], base_offset: usize) -> Option<ParsedPclntab<'_
         functab_offset,
         text_start,
         header_text_start: Some(text_start),
-    })
+        legacy_func: None,
+        wrapper_func_id: None,
+        inline_index_pcdata: None,
+    };
+    pclntab.legacy_func = Some(LegacyFuncLayout::detect(&pclntab));
+    pclntab.wrapper_func_id = pclntab.detect_wrapper_func_id();
+    Some(pclntab)
 }
 
 /// Byte offsets of the fields within a `_func` struct, which changed shape
@@ -1777,7 +2244,8 @@ struct FuncLayout {
     entry_is_abs: bool,
     name_off: usize,
     args: usize,
-    deferreturn: usize,
+    /// `deferreturn` offset (Go 1.12+), else `None` (read as 0).
+    deferreturn: Option<usize>,
     pcsp: usize,
     pcfile: usize,
     pcln: usize,
@@ -1787,52 +2255,69 @@ struct FuncLayout {
     cu_offset: Option<usize>,
     /// `startLine` offset (Go 1.20+), else `None` (read as 0).
     start_line: Option<usize>,
-    /// `funcID` offset, else `None` (read as 0). Absent before Go 1.12; left
-    /// `None` for the Go 1.2-1.15 layout since the magic alone cannot tell
-    /// pre-1.12 from 1.12-1.15 apart and the field is non-critical.
+    /// `funcID` offset, else `None` (read as 0): absent before Go 1.10, and
+    /// placed by [`LegacyFuncLayout`] in Go 1.10-1.15.
     func_id: Option<usize>,
     /// `flag` offset (Go 1.18+), else `None` (read as 0).
     flag: Option<usize>,
-    /// `nfuncdata` offset, else `None` (read as 0). The Go 1.2-1.15 `_func`
-    /// stores `pcsp`/`pcfile`/`pcln` as direct pclntab offsets rather than
-    /// `pcdata[]` indices, so its `funcdata[]` array is not consumed here.
+    /// `nfuncdata` offset (its low byte before Go 1.12, where it is an
+    /// `int32`).
     nfuncdata: Option<usize>,
 }
 
-fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
+fn func_layout(
+    version: PclntabVersion,
+    ptr_size: u8,
+    legacy: Option<LegacyFuncLayout>,
+) -> FuncLayout {
     let p = ptr_size as usize;
     match version {
-        // Go 1.2-1.15: entry uintptr @0; no cuOffset. The fixed fields end at
-        // npcdata (@p+24); funcID (Go 1.12+) and nfuncdata follow but their
-        // exact positions vary within the range and they are non-critical, so
-        // they are left `None`. Stride to the trailing pcdata/funcdata arrays
-        // is `p + 32` (`npcdata` + `funcID`/pad + `nfuncdata`).
+        // Go 1.2-1.15: entry uintptr @0; no cuOffset; eight 32-bit words
+        // follow, the second and the last of which changed meaning (see
+        // `LegacyFuncLayout`). Stride to the trailing pcdata/funcdata arrays
+        // is `p + 32` in every case.
         //
-        // Source: `src/debug/gosym/pclntab.go` (`go12Init`/`funcData`),
-        // `src/runtime/runtime2.go` `_func` (Go 1.2-1.15).
-        PclntabVersion::Go12 => FuncLayout {
-            size: p.saturating_add(32),
-            entry_is_abs: true,
-            name_off: p,
-            args: p.saturating_add(4),
-            deferreturn: p.saturating_add(8),
-            pcsp: p.saturating_add(12),
-            pcfile: p.saturating_add(16),
-            pcln: p.saturating_add(20),
-            npcdata: p.saturating_add(24),
-            cu_offset: None,
-            start_line: None,
-            func_id: None,
-            flag: None,
-            nfuncdata: None,
-        },
+        // Source: `src/runtime/runtime2.go` `_func` (Go 1.2-1.15),
+        // `src/cmd/link/internal/ld/pcln.go`.
+        PclntabVersion::Go12 => {
+            let (deferreturn, func_id, nfuncdata) = match legacy {
+                Some(LegacyFuncLayout::DeferReturn) => (
+                    Some(p.saturating_add(8)),
+                    Some(p.saturating_add(28)),
+                    Some(p.saturating_add(31)),
+                ),
+                // A 32-bit word; its low byte holds the value.
+                Some(LegacyFuncLayout::FuncIdWord) => {
+                    (None, Some(p.saturating_add(8)), Some(p.saturating_add(28)))
+                }
+                Some(LegacyFuncLayout::FrameSize | LegacyFuncLayout::FramePlaceholder) | None => {
+                    (None, None, Some(p.saturating_add(28)))
+                }
+            };
+            FuncLayout {
+                size: p.saturating_add(32),
+                entry_is_abs: true,
+                name_off: p,
+                args: p.saturating_add(4),
+                deferreturn,
+                pcsp: p.saturating_add(12),
+                pcfile: p.saturating_add(16),
+                pcln: p.saturating_add(20),
+                npcdata: p.saturating_add(24),
+                cu_offset: None,
+                start_line: None,
+                func_id,
+                flag: None,
+                nfuncdata,
+            }
+        }
         // Go 1.16-1.17: entry uintptr @0; +cuOffset, +funcID.
         PclntabVersion::Go116 => FuncLayout {
             size: p.saturating_add(36),
             entry_is_abs: true,
             name_off: p,
             args: p.saturating_add(4),
-            deferreturn: p.saturating_add(8),
+            deferreturn: Some(p.saturating_add(8)),
             pcsp: p.saturating_add(12),
             pcfile: p.saturating_add(16),
             pcln: p.saturating_add(20),
@@ -1849,7 +2334,7 @@ fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
             entry_is_abs: false,
             name_off: 4,
             args: 8,
-            deferreturn: 12,
+            deferreturn: Some(12),
             pcsp: 16,
             pcfile: 20,
             pcln: 24,
@@ -1866,7 +2351,7 @@ fn func_layout(version: PclntabVersion, ptr_size: u8) -> FuncLayout {
             entry_is_abs: false,
             name_off: 4,
             args: 8,
-            deferreturn: 12,
+            deferreturn: Some(12),
             pcsp: 16,
             pcfile: 20,
             pcln: 24,

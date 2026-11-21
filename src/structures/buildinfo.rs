@@ -48,10 +48,10 @@
 //! - Modinfo parsing: `src/runtime/debug/mod.go:40-95`
 
 use crate::{
-    detection::find_bytes,
     formats::BinaryContext,
     metadata::{BuildInfo, DepEntry, DepReplacement},
-    structures::util::read_uvarint,
+    util::find_bytes,
+    util::read_uvarint,
 };
 
 /// Build info magic prefix: `"\xff Go buildinf:"` (14 bytes).
@@ -364,6 +364,19 @@ pub fn find_version_string(data: &[u8]) -> Option<&str> {
                 break;
             }
         }
+        // A pre-release keeps its suffix: `go1.27rc1`, `go1.27beta2`.
+        for suffix in [b"rc".as_slice(), b"beta".as_slice()] {
+            let after = end.checked_add(suffix.len())?;
+            if data.get(end..after) == Some(suffix)
+                && data.get(after).is_some_and(u8::is_ascii_digit)
+            {
+                end = after;
+                while end < scan_limit && data.get(end).is_some_and(u8::is_ascii_digit) {
+                    end = end.checked_add(1)?;
+                }
+                break;
+            }
+        }
         if let Some(slice) = data.get(start..end)
             && let Ok(s) = std::str::from_utf8(slice)
             && s.len() >= 5
@@ -374,6 +387,47 @@ pub fn find_version_string(data: &[u8]) -> Option<&str> {
         }
         pos = scan_start;
     }
+}
+
+/// The experiment list a Go version string ends with: what follows ` X:` in
+/// `go1.28 X:arenas,nogreenteagc` (`runtime.Version`, which appends the
+/// experiments that differ from the toolchain's defaults, `no`-prefixed when
+/// turned off). `None` when the string has none.
+pub fn version_experiments(version: &str) -> Option<&str> {
+    let (_, list) = version.rsplit_once(" X:")?;
+    let end = list
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == ',' || c == '_'))
+        .unwrap_or(list.len());
+    list.get(..end).filter(|list| !list.is_empty())
+}
+
+/// Scan binary data for a Go version string with an experiment list, as the
+/// runtime's copy of its version (`runtime.buildVersion`) holds it when the
+/// build info is gone, and return the list ([`version_experiments`]).
+pub fn find_version_experiments(data: &[u8]) -> Option<&str> {
+    let mut pos = 0usize;
+    while let Some(found) = data.get(pos..).and_then(|rest| find_bytes(rest, b"go1.")) {
+        let start = pos.checked_add(found)?;
+        // The version string runs on in printable ASCII; a few dozen bytes
+        // hold the longest, a development version with its commit and date.
+        let end = data
+            .get(start..)?
+            .iter()
+            .take(160)
+            .position(|&b| !(0x20..0x7f).contains(&b))
+            .map_or(data.len().min(start.saturating_add(160)), |n| {
+                start.saturating_add(n)
+            });
+        if let Some(list) = data
+            .get(start..end)
+            .and_then(|run| std::str::from_utf8(run).ok())
+            .and_then(version_experiments)
+        {
+            return Some(list);
+        }
+        pos = start.checked_add(4)?;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -394,6 +448,19 @@ mod tests {
         data[50..58].copy_from_slice(b"go1.26.1");
         data[58] = 0;
         assert_eq!(find_version_string(&data), Some("go1.26.1"));
+    }
+
+    #[test]
+    fn version_scan_keeps_a_prerelease_suffix() {
+        for version in ["go1.27rc1", "go1.27beta2", "go1.9rc12"] {
+            let mut data = vec![0u8; 64];
+            data[20..20 + version.len()].copy_from_slice(version.as_bytes());
+            assert_eq!(find_version_string(&data), Some(version), "{version}");
+        }
+        // `rc` with no digits after it is not a pre-release.
+        let mut data = vec![0u8; 64];
+        data[20..30].copy_from_slice(b"go1.27rcxy");
+        assert_eq!(find_version_string(&data), Some("go1.27"));
     }
 
     #[test]
@@ -431,5 +498,31 @@ dep\texample.com/local\tv0.0.0
         let r1 = info.deps[1].replacement.as_ref().unwrap();
         assert_eq!(r1.path, "./vendored");
         assert_eq!(r1.version, None);
+    }
+
+    #[test]
+    fn experiments_follow_the_version() {
+        assert_eq!(
+            version_experiments(
+                "go1.28-devel_2dbf8b413a Fri Nov 20 21:43:22 2026 -0800 X:arenas,nogreenteagc"
+            ),
+            Some("arenas,nogreenteagc")
+        );
+        assert_eq!(version_experiments("go1.21.0 X:loopvar"), Some("loopvar"));
+        assert_eq!(version_experiments("go1.27.1"), None);
+        assert_eq!(version_experiments("go1.27.1 X:"), None);
+    }
+
+    #[test]
+    fn experiments_are_found_in_raw_data() {
+        let data =
+            b"\x00\x01go1.20 is old\x00runtime\x00go1.22.1 X:loopvar,nocoverageredesign\x8f\x00";
+        assert_eq!(
+            find_version_experiments(data),
+            Some("loopvar,nocoverageredesign")
+        );
+        assert_eq!(find_version_experiments(b"go1.22.1\x00"), None);
+        assert_eq!(find_version_experiments(b"go1."), None);
+        assert_eq!(find_version_experiments(b""), None);
     }
 }

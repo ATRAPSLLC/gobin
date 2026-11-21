@@ -145,13 +145,7 @@ fn inline_trees(bencher: Bencher, name: &str) {
     let data = fixture(path_of(name));
     let bin = GoBinary::parse(data).expect("fixture parses");
     bencher.bench(|| {
-        let Some(pcl) = bin.pclntab() else { return 0 };
-        let mut n = 0usize;
-        for (_, off) in pcl.func_entries() {
-            if let Some(fd) = pcl.parse_func(off) {
-                n += bin.inline_tree(&fd).count();
-            }
-        }
+        let n: usize = bin.functions().map(|f| bin.inline_tree(&f).count()).sum();
         black_box(n)
     });
 }

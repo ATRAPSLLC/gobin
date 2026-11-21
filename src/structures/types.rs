@@ -38,7 +38,7 @@ use std::{
 
 use crate::{
     formats::BinaryContext,
-    metadata::{is_internal_path, is_runtime_path, is_stdlib_path},
+    metadata::{FunctionInfo, is_internal_path, is_runtime_path, is_stdlib_path},
     structures::{
         abitype::AbiType,
         arraytype::ArrayTypeExtra,
@@ -56,8 +56,8 @@ use crate::{
         },
         structtype::{GoStructField, StructTypeExtra},
         uncommon::UncommonType,
-        util::{align_up, align_up_u64, read_uintptr},
     },
+    util::{align_up, align_up_u64, read_uintptr},
 };
 
 /// Re-exported so callers reading [`TypeDetail::Map`] do not have to reach
@@ -90,7 +90,8 @@ pub struct GoType<'a> {
     /// Virtual address of this type's `abi.Type` descriptor. `0` if unknown
     /// (the value was constructed without a known location).
     pub descriptor_va: u64,
-    /// Full type name as stored in the binary (e.g. `"*net/http.Client"`).
+    /// The type's name as the runtime prints it (`rtype.String`), e.g.
+    /// `"*net/http.Client"` or `"net/http.Client"`.
     pub name: &'a str,
     /// Type kind (Bool, Int, Struct, Pointer, Slice, etc.).
     pub kind: TypeKind,
@@ -125,7 +126,8 @@ pub struct GoType<'a> {
     pub has_uncommon: bool,
     /// Whether this is a named type (has a declared name vs anonymous).
     pub is_named: bool,
-    /// Whether the type is exported.
+    /// Whether the type is named and its name, unqualified, starts with an
+    /// upper-case letter (`Client` in `net/http.Client`), as Go exports it.
     pub is_exported: bool,
     /// Number of methods (total), from UncommonType. 0 if no uncommon type.
     pub method_count: u16,
@@ -174,6 +176,21 @@ pub struct MethodEntry<'a> {
     pub interface_text_offset: Option<i32>,
     /// Whether the method's name starts with an uppercase letter.
     pub is_exported: bool,
+}
+
+/// The functions a concrete type's method dispatches to
+/// ([`crate::GoBinary::method_functions`]).
+#[derive(Debug, Clone)]
+pub struct MethodFunctions<'a> {
+    /// The function a direct call runs ([`MethodEntry::function_text_offset`]):
+    /// the method itself, or for a pointer type's promoted value-receiver
+    /// method the wrapper the compiler generated.
+    pub direct: Option<FunctionInfo<'a>>,
+    /// The function an interface call runs
+    /// ([`MethodEntry::interface_text_offset`]): it receives the interface's
+    /// data word, so a value type's method is reached through its pointer
+    /// wrapper unless the value is stored directly in the interface.
+    pub interface: Option<FunctionInfo<'a>>,
 }
 
 /// One field of a [`TypeDetail::Struct`].
@@ -877,60 +894,58 @@ pub fn type_at_va<'a>(
     Some(t)
 }
 
-impl GoType<'_> {
-    /// Whether this type, parsed where no reference pointed, holds every field
-    /// the ABI fixes as a descriptor's own: a power-of-two alignment and field
-    /// alignment no larger than it, pointer bytes within the size, only the
-    /// defined `TFlag` bits, a size and pointer extent its kind fixes for the
-    /// kinds that fix one, an equality field naming the image or nothing
-    /// (`mapped` says whether an address lies in the image: the field holds a
-    /// closure since Go 1.14 and the type's algorithm table before), and a
-    /// pointer-to-this inside the type region or none. `ps` is the pointer
-    /// size, `region` the module's type range.
-    fn holds_as_descriptor(
-        &self,
-        ps: u64,
-        mapped: impl Fn(u64) -> bool,
-        region: &Range<u64>,
-        types_base: u64,
-    ) -> bool {
-        let aligned = |align: u8| matches!(align, 1 | 2 | 4 | 8 | 16);
-        let fixed = match self.kind {
-            TypeKind::Bool | TypeKind::Int8 | TypeKind::Uint8 => Some((1, 0)),
-            TypeKind::Int16 | TypeKind::Uint16 => Some((2, 0)),
-            TypeKind::Int32 | TypeKind::Uint32 | TypeKind::Float32 => Some((4, 0)),
-            TypeKind::Int64 | TypeKind::Uint64 | TypeKind::Float64 | TypeKind::Complex64 => {
-                Some((8, 0))
-            }
-            TypeKind::Complex128 => Some((16, 0)),
-            TypeKind::Int | TypeKind::Uint | TypeKind::Uintptr => Some((ps, 0)),
-            TypeKind::Pointer
-            | TypeKind::UnsafePointer
-            | TypeKind::Map
-            | TypeKind::Chan
-            | TypeKind::Func => Some((ps, ps)),
-            TypeKind::String => Some((ps.saturating_mul(2), ps)),
-            TypeKind::Slice => Some((ps.saturating_mul(3), ps)),
-            TypeKind::Interface => Some((ps.saturating_mul(2), ps.saturating_mul(2))),
-            TypeKind::Array | TypeKind::Struct => None,
-            TypeKind::Invalid => return false,
-        };
-        let pointer_to_this = self.ptr_to_this == 0
-            || u64::try_from(self.ptr_to_this)
-                .ok()
-                .and_then(|offset| types_base.checked_add(offset))
-                .is_some_and(|va| region.contains(&va));
-        aligned(self.align)
-            && aligned(self.field_align)
-            && self.field_align <= self.align
-            && self.ptr_bytes <= self.size
-            && self.tflag & !0x3f == 0
-            && !self.name.is_empty()
-            && fixed
-                .is_none_or(|(size, ptr_bytes)| self.size == size && self.ptr_bytes <= ptr_bytes)
-            && (self.equal_va == 0 || mapped(self.equal_va))
-            && pointer_to_this
-    }
+/// Whether the descriptor header `header`, read where no reference pointed,
+/// holds every field the ABI fixes as a descriptor's own: a power-of-two
+/// alignment and field alignment no larger than it, pointer bytes within the
+/// size, only the defined `TFlag` bits, a size and pointer extent its kind
+/// fixes for the kinds that fix one, an equality field naming the image or
+/// nothing (`mapped` says whether an address lies in the image: the field
+/// holds a closure since Go 1.14 and the type's algorithm table before), and a
+/// pointer-to-this inside the type region or none. `ps` is the pointer size,
+/// `region` the module's type range. The name, the one field outside the
+/// header, is checked once the type is built.
+fn holds_as_descriptor(
+    header: &AbiType,
+    ps: u64,
+    mapped: impl Fn(u64) -> bool,
+    region: &Range<u64>,
+    types_base: u64,
+) -> bool {
+    let aligned = |align: u8| matches!(align, 1 | 2 | 4 | 8 | 16);
+    let fixed = match TypeKind::from_raw(header.kind()) {
+        TypeKind::Bool | TypeKind::Int8 | TypeKind::Uint8 => Some((1, 0)),
+        TypeKind::Int16 | TypeKind::Uint16 => Some((2, 0)),
+        TypeKind::Int32 | TypeKind::Uint32 | TypeKind::Float32 => Some((4, 0)),
+        TypeKind::Int64 | TypeKind::Uint64 | TypeKind::Float64 | TypeKind::Complex64 => {
+            Some((8, 0))
+        }
+        TypeKind::Complex128 => Some((16, 0)),
+        TypeKind::Int | TypeKind::Uint | TypeKind::Uintptr => Some((ps, 0)),
+        TypeKind::Pointer
+        | TypeKind::UnsafePointer
+        | TypeKind::Map
+        | TypeKind::Chan
+        | TypeKind::Func => Some((ps, ps)),
+        TypeKind::String => Some((ps.saturating_mul(2), ps)),
+        TypeKind::Slice => Some((ps.saturating_mul(3), ps)),
+        TypeKind::Interface => Some((ps.saturating_mul(2), ps.saturating_mul(2))),
+        TypeKind::Array | TypeKind::Struct => None,
+        TypeKind::Invalid => return false,
+    };
+    let pointer_to_this = header.ptr_to_this == 0
+        || u64::try_from(header.ptr_to_this)
+            .ok()
+            .and_then(|offset| types_base.checked_add(offset))
+            .is_some_and(|va| region.contains(&va));
+    aligned(header.align_)
+        && aligned(header.field_align_)
+        && header.field_align_ <= header.align_
+        && header.ptr_bytes <= header.size_
+        && header.tflag & !0x3f == 0
+        && fixed
+            .is_none_or(|(size, ptr_bytes)| header.size_ == size && header.ptr_bytes <= ptr_bytes)
+        && (header.equal == 0 || mapped(header.equal))
+        && pointer_to_this
 }
 
 /// Every type descriptor laid out in the type region `[types_base, etypes)`
@@ -951,11 +966,21 @@ pub fn scan_descriptors<'a>(
     }
     let region = types_base..etypes;
     let mapped = |va: u64| ctx.va_to_file(va).is_some();
+    let data = ctx.structure_search_data();
     let mut out = Vec::new();
     let mut va = types_base;
     while va < etypes {
-        if let Some(t) = type_at_va(ctx, va, types_base, abi)
-            .filter(|t| t.holds_as_descriptor(ps, mapped, &region, types_base))
+        // The header's fixed fields rule out almost every address, so they
+        // are checked before the names, methods and fields are read.
+        let holds = ctx
+            .va_to_file(va)
+            .and_then(|off| data.get(off..))
+            .and_then(|rest| AbiType::parse(rest, abi.ps))
+            .is_some_and(|header| holds_as_descriptor(&header, ps, mapped, &region, types_base));
+        if let Some(t) = holds
+            .then(|| type_at_va(ctx, va, types_base, abi))
+            .flatten()
+            .filter(|t| !t.name.is_empty())
         {
             out.push(t);
         }
@@ -1095,12 +1120,46 @@ fn resolve_type_name<'a>(
     }
     let off = ctx.va_to_file(type_va)?;
     let abi = AbiType::parse(full_data.get(off..)?, ps)?;
+    type_string(&abi, full_data, types_base_va, legacy, ctx).filter(|name| !name.is_empty())
+}
+
+/// The name of the type `abi` describes, as the runtime's `rtype.String`
+/// reads it: its `Str` name, less the leading `*` when the descriptor sets
+/// [`crate::structures::abitype::TFLAG_EXTRA_STAR`]. The linker gives a type `T` the string `*T` of its
+/// pointer type, to store it once, and marks `T` so.
+fn type_string<'a>(
+    abi: &AbiType,
+    full_data: &'a [u8],
+    types_base_va: u64,
+    legacy: bool,
+    ctx: &BinaryContext<'a>,
+) -> Option<&'a str> {
     let name_va = (types_base_va as i64).saturating_add(abi.str_off as i64) as u64;
     let name = ctx
         .va_to_file(name_va)
         .and_then(|o| full_data.get(o..))
         .and_then(|d| decode_name(d, legacy))?;
-    if name.is_empty() { None } else { Some(name) }
+    if abi.has_extra_star() {
+        name.strip_prefix('*')
+    } else {
+        Some(name)
+    }
+}
+
+/// The unqualified name of a named type (`reflect.Type.Name`): what follows
+/// the last `.` outside square brackets, so `Pair` for `main.Pair` and
+/// `List[main.T]` for `main.List[main.T]`.
+fn unqualified_name(name: &str) -> &str {
+    let mut depth = 0usize;
+    for (i, c) in name.char_indices().rev() {
+        match c {
+            ']' => depth = depth.saturating_add(1),
+            '[' => depth = depth.saturating_sub(1),
+            '.' if depth == 0 => return name.get(i.saturating_add(1)..).unwrap_or(""),
+            _ => {}
+        }
+    }
+    name
 }
 
 /// Build a `GoType` from a parsed `AbiType` by resolving its name and
@@ -1120,26 +1179,17 @@ fn build_go_type<'a>(
     } = abi;
     let kind = TypeKind::from_raw(abi_type.kind());
 
-    // Resolve name via Str (NameOff from types base)
-    let name_va = (types_base_va as i64).saturating_add(abi_type.str_off as i64) as u64;
-    let name: &'a str = ctx
-        .va_to_file(name_va)
-        .and_then(|off| full_data.get(off..))
-        .and_then(|d| decode_name(d, legacy))
-        .unwrap_or("");
+    let name: &'a str = type_string(abi_type, full_data, types_base_va, legacy, ctx).unwrap_or("");
 
     if name.is_empty() && kind == TypeKind::Invalid {
         return None;
     }
 
-    let is_exported = name.chars().next().is_some_and(|c| {
-        let c = if c == '*' {
-            name.chars().nth(1).unwrap_or('a')
-        } else {
-            c
-        };
-        c.is_ascii_uppercase()
-    });
+    let is_exported = abi_type.is_named()
+        && unqualified_name(name)
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase());
 
     let base_sz = AbiType::size(ps);
 

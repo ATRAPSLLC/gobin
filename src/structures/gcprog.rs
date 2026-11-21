@@ -21,7 +21,7 @@
 //!
 //! Source: `src/runtime/mbitmap.go` (`runGCProg`, "Packed GC pointer bitmaps").
 
-use crate::structures::util::read_uvarint;
+use crate::util::read_uvarint;
 
 /// Safety bound on the number of decoded words, on top of the caller's
 /// `max_words`, so a malformed `repeat` count cannot allocate unboundedly.

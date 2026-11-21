@@ -23,7 +23,7 @@
 //!
 //! Source: `src/internal/abi/type.go:437-461`
 
-use crate::structures::{goslice::GoSlice, util::read_uintptr};
+use crate::{structures::goslice::GoSlice, util::read_uintptr};
 
 /// Parsed extra fields for a struct type descriptor.
 #[derive(Debug, Clone, Copy, Default)]
